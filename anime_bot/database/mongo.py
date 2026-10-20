@@ -4,8 +4,13 @@ from anime_bot.config import Settings
 
 class Mongo:
     def __init__(self, settings: Settings):
-        self.client = AsyncIOMotorClient(settings.mongodb_uri.get_secret_value(), serverSelectionTimeoutMS=5000,
-                                         connectTimeoutMS=5000, maxPoolSize=30, retryWrites=True)
+        self.client = AsyncIOMotorClient(
+            settings.mongodb_uri.get_secret_value(),
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            maxPoolSize=30,
+            retryWrites=True,
+        )
         self.db: AsyncIOMotorDatabase = self.client[settings.mongodb_database]
 
     async def start(self) -> None:
