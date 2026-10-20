@@ -1,6 +1,7 @@
 import html
 import logging
 import asyncio
+import re
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
@@ -27,14 +28,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("anime_bot")
 STATUS_LABELS = {
-    "plan": "?? Plan to Watch",
-    "watching": "?? Watching",
-    "completed": "? Completed",
-    "on_hold": "? On Hold",
-    "dropped": "? Dropped",
-    "rewatching": "?? Rewatching",
-    "not_interested": "?? Not Interested",
-    "unknown": "? Unknown",
+    "plan": "📝 Plan to Watch",
+    "watching": "▶️ Watching",
+    "completed": "✅ Completed",
+    "on_hold": "⏸ On Hold",
+    "dropped": "❌ Dropped",
+    "rewatching": "🔁 Rewatching",
+    "not_interested": "🚫 Not Interested",
+    "unknown": "❔ Unknown",
 }
 STATUS_CHOICES = tuple(k for k in STATUS_LABELS if k != "unknown")
 PAGE_SIZE = 8
@@ -43,7 +44,7 @@ START_IMAGES = (
     "https://graph.org/file/dc7fcd70a16a81e6da48f-b633fcf31d25c21088.jpg",
     "https://graph.org/file/9cb5e9c3285fe51ef4b0f-7294b1a2290fdd2c38.jpg",
 )
-LOADING_FRAMES = ("???", "???", "???")
+LOADING_FRAMES = ("▣☐☐", "☐▣☐", "☐☐▣")
 LOADING_MESSAGES = {}
 
 
@@ -86,8 +87,12 @@ async def allowed(
                     await update.callback_query.edit_message_text(
                         "Access denied. Use /request_access to ask the owner."
                     )
-                except BadRequest:
-                    pass
+                except BadRequest as exc:
+                    log.warning("Could not edit access-denied response: %s", exc)
+                    if update.effective_message:
+                        await update.effective_message.reply_text(
+                            "Access denied. Use /request_access to ask the owner."
+                        )
         elif update.effective_message:
             await update.effective_message.reply_text(
                 "Access denied. Use /request_access to ask the owner."
@@ -113,8 +118,10 @@ async def allowed(
         if update.callback_query and callback_answered:
             try:
                 await update.callback_query.edit_message_text("Owner only.")
-            except BadRequest:
-                pass
+            except BadRequest as exc:
+                log.warning("Could not edit owner-only response: %s", exc)
+                if update.effective_message:
+                    await update.effective_message.reply_text("Owner only.")
         elif update.effective_message:
             await update.effective_message.reply_text("Owner only.")
         return False
@@ -153,7 +160,7 @@ async def render(update, text, markup=None):
             if "message is not modified" in str(exc).casefold():
                 return
             # For old messages that Telegram will not edit, fall back to one fresh screen.
-            log.debug("Could not edit callback message, sending replacement: %s", exc)
+            log.warning("Could not edit callback screen: %s", exc)
     key = _message_key(update)
     target = LOADING_MESSAGES.pop(key, None)
     if target:
@@ -175,12 +182,21 @@ async def render(update, text, markup=None):
             log.debug("Could not replace loading message: %s", exc)
     message = update.effective_message
     if message:
-        await message.reply_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-            disable_web_page_preview=True,
-        )
+        try:
+            await message.reply_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            log.warning("Could not send formatted screen: %s", exc)
+            plain_text = html.unescape(re.sub(r"<[^>]*>", "", text))
+            # Preserve a visible response even if Telegram rejects rich text/markup.
+            try:
+                await message.reply_text(plain_text, disable_web_page_preview=True)
+            except TelegramError as fallback_exc:
+                log.error("Plain-text fallback failed: %s", fallback_exc)
 
 
 def _message_key(update):
@@ -216,7 +232,7 @@ async def _animate_loading(target, stop, label, interval=1.1):
             return
 
 
-async def run_with_loading(update, context, operation, label="Loading.", threshold=0.8):
+async def run_with_loading(update, context, operation, label="Loading…", threshold=0.8):
     """Run an awaitable and animate only after it exceeds the short-operation threshold."""
     lock = context.user_data.setdefault("_loading_lock", asyncio.Lock())
     async with lock:
@@ -273,13 +289,13 @@ async def run_with_loading(update, context, operation, label="Loading.", thresho
 async def _render_current(update, context):
     try:
         return await run_with_loading(
-            update, context, lambda: _render_screen(update, context), "Loading."
+            update, context, lambda: _render_screen(update, context), "Loading…"
         )
     except Exception as exc:
-        log.warning("Could not render screen (%s)", type(exc).__name__)
+        log.warning("Could not render screen: %s", exc)
         return await render(
             update,
-            "<b><blockquote>?? ?????? ?? ????</blockquote></b>\nPlease try again.",
+            "<b><blockquote>⚠️ ᴜɴᴀʙʟᴇ ᴛᴏ ʟᴏᴀᴅ</blockquote></b>\nPlease try again.",
             home_markup(),
         )
 
@@ -288,38 +304,38 @@ def home_markup():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("?? Search", callback_data="v1:search"),
-                InlineKeyboardButton("?? Watchlist", callback_data="v1:watchlist"),
+                InlineKeyboardButton("🎌 Search", callback_data="v1:search"),
+                InlineKeyboardButton("📚 Watchlist", callback_data="v1:watchlist"),
             ],
             [
                 InlineKeyboardButton(
-                    "?? Watching", callback_data="v1:statuslist:watching"
+                    "▶️ Watching", callback_data="v1:statuslist:watching"
                 ),
                 InlineKeyboardButton(
-                    "? Completed", callback_data="v1:statuslist:completed"
+                    "✅ Completed", callback_data="v1:statuslist:completed"
                 ),
             ],
             [
-                InlineKeyboardButton("?? Plan", callback_data="v1:statuslist:plan"),
+                InlineKeyboardButton("📝 Plan", callback_data="v1:statuslist:plan"),
                 InlineKeyboardButton(
-                    "? On Hold", callback_data="v1:statuslist:on_hold"
+                    "⏸ On Hold", callback_data="v1:statuslist:on_hold"
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "? Recommendations", callback_data="v1:genres:recommend"
+                    "✨ Recommendations", callback_data="v1:genres:recommend"
                 ),
-                InlineKeyboardButton("? Top by genre", callback_data="v1:genres:top"),
+                InlineKeyboardButton("⭐ Top by genre", callback_data="v1:genres:top"),
             ],
             [
-                InlineKeyboardButton("?? Movies", callback_data="v1:genres:movie"),
-                InlineKeyboardButton("?? Series", callback_data="v1:genres:series"),
+                InlineKeyboardButton("🎬 Movies", callback_data="v1:genres:movie"),
+                InlineKeyboardButton("📺 Series", callback_data="v1:genres:series"),
             ],
             [
-                InlineKeyboardButton("? Help", callback_data="v1:help"),
-                InlineKeyboardButton("?? About", callback_data="v1:about"),
+                InlineKeyboardButton("❔ Help", callback_data="v1:help"),
+                InlineKeyboardButton("ℹ️ About", callback_data="v1:about"),
             ],
-            [InlineKeyboardButton("?? Statistics", callback_data="v1:stats")],
+            [InlineKeyboardButton("📊 Statistics", callback_data="v1:stats")],
         ]
     )
 
@@ -327,9 +343,9 @@ def home_markup():
 def navigation_row(*, back=True, home=True):
     row = []
     if back:
-        row.append(InlineKeyboardButton("?? Back", callback_data="v1:back"))
+        row.append(InlineKeyboardButton("⬅️ Back", callback_data="v1:back"))
     if home:
-        row.append(InlineKeyboardButton("?? Home", callback_data="v1:home"))
+        row.append(InlineKeyboardButton("🏠 Home", callback_data="v1:home"))
     return [row] if row else []
 
 
@@ -455,7 +471,7 @@ async def _list_titles(db, user_id, screen, metadata=None):
         values = await rec.recommend(user_id, limit=MAX_CATALOGUE, genre=genre)
         return [
             a for a, _ in values
-        ], f"Recommendations � {html.escape(genre or 'all genres')}"
+        ], f"Recommendations · {html.escape(genre or 'all genres')}"
     if mode == "top":
         watches = await _watch_map(db, user_id)
         rated = []
@@ -485,10 +501,10 @@ async def _list_titles(db, user_id, screen, metadata=None):
             )
             else "Verified IMDb ratings"
         )
-        return [a for _, a in rated], f"{label} � {html.escape(genre or '')}"
+        return [a for _, a in rated], f"{label} · {html.escape(genre or '')}"
     catalogue.sort(key=lambda a: str(a.get("title", "")).casefold())
     heading = {"movie": "Movies", "series": "Series"}.get(mode, "Anime")
-    return catalogue, f"{heading} � {html.escape(genre or 'all genres')}"
+    return catalogue, f"{heading} · {html.escape(genre or 'all genres')}"
 
 
 def _title_keyboard(rows, page, mode):
@@ -500,7 +516,7 @@ def _title_keyboard(rows, page, mode):
         year = anime.get("year")
         label = f"{title} ({year})" if year else title
         if anime.get("_display_rating") is not None:
-            label += f" � ? {anime['_display_rating']:g}/10"
+            label += f" · ⭐ {anime['_display_rating']:g}/10"
         button = InlineKeyboardButton(
             label[:60], callback_data=f"v1:anime:{anime['_id']}"
         )
@@ -532,7 +548,7 @@ def _title_keyboard(rows, page, mode):
         pages = []
         if page > 0:
             pages.append(
-                InlineKeyboardButton("?? Previous", callback_data=f"v1:page:{page - 1}")
+                InlineKeyboardButton("⬅️ Previous", callback_data=f"v1:page:{page - 1}")
             )
         pages.append(
             InlineKeyboardButton(
@@ -541,7 +557,7 @@ def _title_keyboard(rows, page, mode):
         )
         if page + 1 < page_count:
             pages.append(
-                InlineKeyboardButton("Next ??", callback_data=f"v1:page:{page + 1}")
+                InlineKeyboardButton("Next ➡️", callback_data=f"v1:page:{page + 1}")
             )
         keyboard.append(pages)
     keyboard.extend(navigation_row())
@@ -550,14 +566,14 @@ def _title_keyboard(rows, page, mode):
 
 def _wtw_screen(title, offers):
     lines = [
-        "<b><blockquote>?? ????? ?? ?????</blockquote></b>",
-        f"{html.escape(str(title or 'Untitled'))} � Region {html.escape(offers['region'])}",
+        "<b><blockquote>📺 ᴡʜᴇʀᴇ ᴛᴏ ᴡᴀᴛᴄʜ</blockquote></b>",
+        f"{html.escape(str(title or 'Untitled'))} · Region {html.escape(offers['region'])}",
     ]
     buttons = []
     if offers["available"]:
         lines.append("<b>Verified provider listings</b>")
         lines.extend(
-            f" {html.escape(item['name'])} � {html.escape(item['type'].title())}"
+            f"• {html.escape(item['name'])} · {html.escape(item['type'].title())}"
             for item in offers["offers"]
         )
         if offers.get("link"):
@@ -593,7 +609,7 @@ def _wtw_screen(title, offers):
         ]
     )
     lines.append(
-        "Search buttons open the service's title search; they do not confirm availability."
+        "Search buttons open the service’s title search; they do not confirm availability."
     )
     buttons.extend(navigation_row())
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
@@ -608,7 +624,7 @@ async def _render_screen(update, context):
     if kind == "home":
         return await render(
             update,
-            "?? <b>Anime Command Center</b>\nYour private anime tracker. Choose an action:",
+            "🎌 <b>Anime Command Center</b>\nYour private anime tracker. Choose an action:",
             home_markup(),
         )
     if kind == "help":
@@ -659,7 +675,7 @@ async def _render_screen(update, context):
             if page > 0:
                 pages.append(
                     InlineKeyboardButton(
-                        "?? Previous", callback_data=f"v1:gpage:{page - 1}"
+                        "⬅️ Previous", callback_data=f"v1:gpage:{page - 1}"
                     )
                 )
             pages.append(
@@ -670,7 +686,7 @@ async def _render_screen(update, context):
             )
             if first + PAGE_SIZE < len(genres):
                 pages.append(
-                    InlineKeyboardButton("Next ??", callback_data=f"v1:gpage:{page + 1}")
+                    InlineKeyboardButton("Next ➡️", callback_data=f"v1:gpage:{page + 1}")
                 )
             keyboard.append(pages)
         keyboard.extend(navigation_row())
@@ -682,7 +698,7 @@ async def _render_screen(update, context):
         }.get(screen["mode"], "Choose a genre")
         return await render(
             update,
-            f"<b><blockquote>?? {title}</blockquote></b>",
+            f"<b><blockquote>🎭 {title}</blockquote></b>",
             InlineKeyboardMarkup(keyboard),
         )
     if kind == "titles":
@@ -705,7 +721,7 @@ async def _render_screen(update, context):
         keyboard = _title_keyboard(rows, page, screen["mode"])
         return await render(
             update,
-            f"<b><blockquote>{heading}</blockquote></b> � {len(rows)} title(s)\nChoose a title:",
+            f"<b><blockquote>{heading}</blockquote></b> · {len(rows)} title(s)\nChoose a title:",
             keyboard,
         )
     if kind == "detail":
@@ -727,20 +743,20 @@ async def _render_screen(update, context):
         )
         genres = ", ".join(_genre_values(anime)) or "Not available"
         lines = [
-            f"<b><blockquote>?? {html.escape(str(anime.get('title', 'Untitled')))}"
+            f"<b><blockquote>🎌 {html.escape(str(anime.get('title', 'Untitled')))}"
             + (f" ({html.escape(str(anime['year']))})" if anime.get("year") else ""),
             "</blockquote></b>",
-            f"?? ??????: {html.escape(str(anime.get('format', 'Unknown')))}",
-            f"?? ?????s: {html.escape(genres)}",
-            f"?? s????s: {status}",
+            f"🎬 ꜰᴏʀᴍᴀᴛ: {html.escape(str(anime.get('format', 'Unknown')))}",
+            f"🎭 ɢᴇɴʀᴇs: {html.escape(genres)}",
+            f"📌 sᴛᴀᴛᴜs: {status}",
         ]
         if rating is not None:
-            lines.append(f"? My rating: {html.escape(str(rating))}/10")
+            lines.append(f"⭐ My rating: {html.escape(str(rating))}/10")
         elif _verified_catalogue_rating(anime) is not None:
-            lines.append(f"? IMDb: {_verified_catalogue_rating(anime):g}/10")
+            lines.append(f"⭐ IMDb: {_verified_catalogue_rating(anime):g}/10")
         if progress:
             lines.append(
-                f"?? Episodes watched: {progress.get('episodes_completed', 0)}"
+                f"📺 Episodes watched: {progress.get('episodes_completed', 0)}"
             )
         lines.append(
             html.escape(str(anime.get("synopsis") or "Synopsis unavailable.")[:700])
@@ -748,7 +764,7 @@ async def _render_screen(update, context):
         buttons = [
             [
                 InlineKeyboardButton(
-                    "?? Change status", callback_data=f"v1:status:{anime['_id']}"
+                    "🔄 Change status", callback_data=f"v1:status:{anime['_id']}"
                 )
             ]
         ]
@@ -757,10 +773,10 @@ async def _render_screen(update, context):
                 0,
                 [
                     InlineKeyboardButton(
-                        "? Episode", callback_data=f"v1:progress:{anime['_id']}:1"
+                        "➕ Episode", callback_data=f"v1:progress:{anime['_id']}:1"
                     ),
                     InlineKeyboardButton(
-                        "? Episode", callback_data=f"v1:progress:{anime['_id']}:-1"
+                        "➖ Episode", callback_data=f"v1:progress:{anime['_id']}:-1"
                     ),
                 ],
             )
@@ -771,7 +787,7 @@ async def _render_screen(update, context):
             else "https://www.imdb.com/find/?q="
             + quote_plus(str(anime.get("title", "")))
         )
-        buttons.append([InlineKeyboardButton("?? IMDb", url=url)])
+        buttons.append([InlineKeyboardButton("🌐 IMDb", url=url)])
         buttons.extend(navigation_row())
         return await render(update, "\n".join(lines), InlineKeyboardMarkup(buttons))
     if kind == "wtw_offer":
@@ -790,14 +806,14 @@ async def _render_screen(update, context):
         )
         title = html.escape(str(anime.get("title", "Untitled")))
         lines = [
-            "<b><blockquote>?? ????? ?? ?????</blockquote></b>",
-            f"{title} � Region {html.escape(offers['region'])}",
+            "<b><blockquote>📺 ᴡʜᴇʀᴇ ᴛᴏ ᴡᴀᴛᴄʜ</blockquote></b>",
+            f"{title} · Region {html.escape(offers['region'])}",
         ]
         buttons = []
         if offers["available"]:
             lines.append("<b>Verified provider listings</b>")
             lines.extend(
-                f" {html.escape(item['name'])} � {html.escape(item['type'].title())}"
+                f"• {html.escape(item['name'])} · {html.escape(item['type'].title())}"
                 for item in offers["offers"]
             )
             if offers.get("link"):
@@ -834,7 +850,7 @@ async def _render_screen(update, context):
             ]
         )
         lines.append(
-            "Search buttons open the service's title search; they do not confirm availability."
+            "Search buttons open the service’s title search; they do not confirm availability."
         )
         buttons.extend(navigation_row())
         return await render(update, "\n".join(lines), InlineKeyboardMarkup(buttons))
@@ -851,7 +867,7 @@ async def _render_screen(update, context):
         keyboard = [
             [
                 InlineKeyboardButton(
-                    ("� " if current == status else "") + STATUS_LABELS[status],
+                    ("✓ " if current == status else "") + STATUS_LABELS[status],
                     callback_data=f"v1:set:{status}:{anime['_id']}",
                 )
             ]
@@ -877,7 +893,7 @@ async def _render_screen(update, context):
         ).to_list(1)
         total = await db.anime.count_documents({})
         text = (
-            f"<b><blockquote>?? ???? s???s</blockquote></b>\nCatalogue: {total}\nCompleted: {counts['completed']}\nWatching: {counts['watching']}\n"
+            f"<b><blockquote>📊 ʏᴏᴜʀ sᴛᴀᴛs</blockquote></b>\nCatalogue: {total}\nCompleted: {counts['completed']}\nWatching: {counts['watching']}\n"
             f"Plan to watch: {counts['plan']}\nOn hold: {counts['on_hold']}\nDropped: {counts['dropped']}\nEpisodes watched: {prog[0]['episodes'] if prog else 0}"
         )
         return await render(update, text, InlineKeyboardMarkup(navigation_row()))
@@ -893,13 +909,13 @@ async def _render_screen(update, context):
                 .sort("at", 1)
                 .to_list(5000)
             )
-            title = "? Pending access requests"
+            title = "⏳ Pending access requests"
         else:
             rows = await _registered_users(db)
             authorized_count = await db.authorized_users.count_documents(
                 {"blocked": {"$ne": True}}
             )
-            title = f"?? Registered users: {len(rows)} � Authorized: {authorized_count}"
+            title = f"👥 Registered users: {len(rows)} · Authorized: {authorized_count}"
         if not rows:
             return await render(
                 update,
@@ -922,16 +938,16 @@ async def _render_screen(update, context):
             username = row.get("username")
             label = html.escape(display_name or "Name unavailable")
             if username:
-                label += " � @" + html.escape(str(username))
-            lines.append(f" <code>{user_id}</code> � {label}")
+                label += " · @" + html.escape(str(username))
+            lines.append(f"• <code>{user_id}</code> · {label}")
             if kind == "pending_users":
                 keyboard.append(
                     [
                         InlineKeyboardButton(
-                            "? Approve", callback_data=f"v1:request:approve:{user_id}"
+                            "✅ Approve", callback_data=f"v1:request:approve:{user_id}"
                         ),
                         InlineKeyboardButton(
-                            "? Reject", callback_data=f"v1:request:reject:{user_id}"
+                            "❌ Reject", callback_data=f"v1:request:reject:{user_id}"
                         ),
                     ]
                 )
@@ -940,7 +956,7 @@ async def _render_screen(update, context):
             if page:
                 pages.append(
                     InlineKeyboardButton(
-                        "?? Previous", callback_data=f"v1:adminpage:{kind}:{page - 1}"
+                        "⬅️ Previous", callback_data=f"v1:adminpage:{kind}:{page - 1}"
                     )
                 )
             pages.append(
@@ -952,7 +968,7 @@ async def _render_screen(update, context):
             if start + page_size < len(rows):
                 pages.append(
                     InlineKeyboardButton(
-                        "Next ??", callback_data=f"v1:adminpage:{kind}:{page + 1}"
+                        "Next ➡️", callback_data=f"v1:adminpage:{kind}:{page + 1}"
                     )
                 )
             keyboard.append(pages)
@@ -969,26 +985,26 @@ async def _open(update, context, screen, reset=False):
 def welcome_text(first_name):
     name = html.escape(first_name or "darling", quote=True)
     return (
-        "<b><blockquote>????? ?? ??????? "
-        f"{name} ??,</blockquote>\n"
-        "   ?'? ? ???????? ????? ????? ?? ?? "
-        '<a href="https://t.me/Nobita_MUI">?????</a> , ??? ????? ? ???? ???? ??? ?? ??? ???? ?? ?????? ??? ???? ??? ??? ??Q???? ?? '
-        '<a href="https://t.me/Nobita_MUI">?????</a> , ?? ??????? ?? /request_access !</b>'
+        "<b><blockquote>ʜᴇʟʟᴏ ᴍʏ ᴅᴀʀʟɪɴɢ "
+        f"{name} 👋,</blockquote>\n"
+        "   ɪ'ᴍ ᴀ ᴘᴇʀꜱᴏɴᴀʟ ᴀɴɪᴍᴇ ᴠᴀᴜʟᴛ ᴏꜰ ᴍʏ "
+        '<a href="https://t.me/Nobita_MUI">ʜᴜʙʙʏ</a> , ᴀɴᴅ ꜱᴏʀʀʏ ɪ ᴄᴀɴᴛ ʜᴇʟᴘ ʙᴜᴛ ɪꜰ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ʀᴇᴀʟʟʏ ᴜꜱᴇ ᴛʜᴇɴ ʏᴏᴜ ᴄᴀɴ ʀᴇQᴜᴇꜱᴛ ᴍʏ '
+        '<a href="https://t.me/Nobita_MUI">ʜᴜʙʙʏ</a> , ʙʏ ꜱᴇɴᴅɪɴɢ ᴍᴇ /request_access !</b>'
     )
 
 
 def help_text():
     return (
-        "<b><blockquote>? ???? &amp; ???????s</blockquote></b>\n"
-        "<b>????????</b>\n"
-        "/start � /help � /about � /request_access\n"
-        "/search &lt;title&gt; � /add &lt;title&gt; [| genres]\n"
-        "/watchlist � /watching � /completed � /plan � /onhold � /dropped\n"
-        "/recommendations � /top � /movies � /series\n"
-        "/wtw &lt;title&gt; � /progress � /continue � /stats � /export\n\n"
-        "<b>????? ????</b>\n"
-        "/users � /pending_users � /allow &lt;id&gt; � /deny &lt;id&gt;\n"
-        "/approve &lt;id&gt; � /reject &lt;id&gt; � /block &lt;id&gt; � /unblock &lt;id&gt; � /health"
+        "<b><blockquote>❔ ʜᴇʟᴘ &amp; ᴄᴏᴍᴍᴀɴᴅs</blockquote></b>\n"
+        "<b>ᴛʀᴀᴄᴋɪɴɢ</b>\n"
+        "/start · /help · /about · /request_access\n"
+        "/search &lt;title&gt; · /add &lt;title&gt; [| genres]\n"
+        "/watchlist · /watching · /completed · /plan · /onhold · /dropped\n"
+        "/recommendations · /top · /movies · /series\n"
+        "/wtw &lt;title&gt; · /progress · /continue · /stats · /export\n\n"
+        "<b>ᴏᴡɴᴇʀ ᴏɴʟʏ</b>\n"
+        "/users · /pending_users · /allow &lt;id&gt; · /deny &lt;id&gt;\n"
+        "/approve &lt;id&gt; · /reject &lt;id&gt; · /block &lt;id&gt; · /unblock &lt;id&gt; · /health"
     )
 
 
@@ -1011,15 +1027,15 @@ async def about_text(context):
         context.application.bot_data["settings"].deployment_provider, quote=True
     )
     return (
-        "<b><blockquote>?���[ ?? ??????? ]���?</blockquote>\n\n"
-        f"? ?? ???? : {linked_name}\n"
-        '? ?? ??????? : <a href="tg://settings">?? ???????</a>\n'
-        '? ????????? : <a href="https://t.me/Nobita_MUI">?????</a>\n'
-        '? ??????? : <a href="https://docs.python-telegram-bot.org/en/v22.5/">python-telegram-bot 22.5</a>\n'
-        '? ???????? : <a href="https://www.python.org/download/releases/3.0/">?????? 3</a>\n'
-        '? ???? ??s? : <a href="https://www.mongodb.com/">????? ??</a>\n'
-        f"? ??? s????? : {provider}\n"
-        "? ????? s????s : ?2.7.1 [s?????]</b>"
+        "<b><blockquote>⍟───[ ᴍʏ ᴅᴇᴛᴀɪʟꜱ ]───⍟</blockquote>\n\n"
+        f"‣ ᴍʏ ɴᴀᴍᴇ : {linked_name}\n"
+        '‣ ᴍʏ ᴅᴀʀʟɪɴɢ : <a href="tg://settings">ᴍʏ ᴅᴀʀʟɪɴɢ</a>\n'
+        '‣ ᴅᴇᴠᴇʟᴏᴘᴇʀ : <a href="https://t.me/Nobita_MUI">ʜᴜʙʙʏ</a>\n'
+        '‣ ʟɪʙʀᴀʀʏ : <a href="https://docs.python-telegram-bot.org/en/v22.5/">python-telegram-bot 22.5</a>\n'
+        '‣ ʟᴀɴɢᴜᴀɢᴇ : <a href="https://www.python.org/download/releases/3.0/">ᴘʏᴛʜᴏɴ 3</a>\n'
+        '‣ ᴅᴀᴛᴀ ʙᴀsᴇ : <a href="https://www.mongodb.com/">ᴍᴏɴɢᴏ ᴅʙ</a>\n'
+        f"‣ ʙᴏᴛ sᴇʀᴠᴇʀ : {provider}\n"
+        "‣ ʙᴜɪʟᴅ sᴛᴀᴛᴜs : ᴠ2.7.1 [sᴛᴀʙʟᴇ]</b>"
     )
 
 
@@ -1398,7 +1414,7 @@ async def callbacks(update, context):
             )
         raise ValueError("Unknown action")
     except Exception as exc:
-        log.info("Callback rejected (%s)", type(exc).__name__)
+        log.warning("Callback failed: %s", exc)
         await render(
             update,
             "That action expired or could not be completed. Reopen the menu and try again.",
@@ -1492,7 +1508,7 @@ async def wtw_cmd(update, context):
             )
         return await _render_screen(update, context)
 
-    await run_with_loading(update, context, operation, "Searching provider listings.")
+    await run_with_loading(update, context, operation, "Searching provider listings…")
 
 
 async def admin(update, context):
@@ -1586,11 +1602,11 @@ async def export_cmd(update, context):
 
     try:
         content = await run_with_loading(
-            update, context, make_export, "Preparing your export."
+            update, context, make_export, "Preparing your export…"
         )
     except Exception as exc:
         log.warning("Export failed (%s)", type(exc).__name__)
-        await render(update, "?? Could not prepare your export. Please try again.")
+        await render(update, "⚠️ Could not prepare your export. Please try again.")
         return
     placeholder = LOADING_MESSAGES.pop(_message_key(update), None)
     if placeholder:
