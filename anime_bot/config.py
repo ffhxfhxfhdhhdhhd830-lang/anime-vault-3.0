@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = Field(default=21600, alias="CACHE_TTL_SECONDS", ge=60)
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     allow_groups: bool = Field(default=False, alias="ALLOW_GROUPS")
+    deployment_provider: str = Field(
+        default="Not configured", alias="DEPLOYMENT_PROVIDER"
+    )
 
     @field_validator("default_region")
     @classmethod
@@ -44,3 +47,4 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
