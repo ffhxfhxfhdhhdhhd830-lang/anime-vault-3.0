@@ -33,10 +33,22 @@ Run checks with `python -m pytest` and `ruff check .`. Stop locally with Ctrl+C;
 
 ## Metadata and streaming providers
 
-IMDb's official data API access is governed through AWS Data Exchange and requires a valid subscription, dataset/revision/asset and its authorized endpoint/authentication setup. A generic API key is insufficient. This build does not pretend to implement that gated integration. `TMDB_API_KEY` is reserved for a future authorized adapter; IMDb ratings are not inferred from TMDb. Streaming availability needs an authorized provider such as a JustWatch partner API token; no public partner credential is assumed, and this build does not report provider offers without it. The bot can offer IMDb title search links, which are search links rather than evidence of rating or availability.
+`TMDB_API_KEY` optionally enables TMDb genre enrichment and region-specific provider listings for `/wtw`. A title is matched by name and format with a confidence threshold; uncertain matches are left unresolved. Provider search links are clearly labeled and do not verify availability. TMDb provider listings and its returned link are the source of verified offers. `STREAMING_API_KEY` remains reserved because no authorized provider API adapter is configured. IMDb ratings are not inferred from TMDb.
+
+Set `DEFAULT_REGION=IN` (or another TMDb region code) and optionally configure `DEPLOYMENT_PROVIDER` for the About screen. The default About value is "Not configured."
+
+Genre normalization supports legacy fields such as `genre`, `Genres`, and `genre_names`. Run a safe, repeatable backfill after deployment:
+
+```powershell
+python scripts/backfill_genres.py --dry-run
+python scripts/backfill_genres.py
+```
+
+The backfill only adds/normalizes the anime document's `genres` field; it does not touch watchlist or progress records.
 
 ## Current scope and limitations
 
-Implemented: async Telegram command bot, Mongo persistence/indexes, owner-only authorization administration, generic access requests, private-chat default, catalogue search and manual additions, single-message inline browsing with title buttons and pagination, status-aware watchlist updates, genre-first movie/series/recommendation/top screens, personal-rating rankings with explicitly sourced IMDb/OMDb ratings as a fallback, episode progress service, personal JSON export, explainable recommendations, statistics, confirmed-title seeding, and Excel dry-run/import command. External metadata enrichment, verified live streaming, persistent reminder scheduling, custom collections, and interactive rating/review entry are not implemented yet. Commands requiring these features respond honestly rather than fabricating results.
+Implemented: async Telegram command bot, Mongo persistence/indexes, owner-only authorization administration, persisted access requests, private-chat default, catalogue search and manual additions, single-message inline browsing with title buttons and pagination, status-aware watchlist updates, normalized genre recommendations and rankings, optional cached TMDb genre/provider enrichment, `/wtw`, `/users`, `/pending_users`, Help and About screens, start images with a separate menu message, personal JSON export, statistics, confirmed-title seeding, and Excel dry-run/import command. Persistent reminder scheduling, custom collections, and interactive rating/review entry are not implemented yet. Commands requiring these features respond honestly rather than fabricating results.
 
 All handlers that reveal personal or catalogue data check authorization. The owner is always recognized by numeric ID; approved users are stored in `authorized_users`. MongoDB is never dropped or cleared at startup. Keep a least-privilege DB account and encrypted backups.
+
