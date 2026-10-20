@@ -7,6 +7,7 @@ from openpyxl import load_workbook
 from anime_bot.config import get_settings
 from anime_bot.database.mongo import Mongo
 from anime_bot.services.core import normalize
+from anime_bot.services.genres import genres_for, normalize_genres
 
 TITLE_COLUMNS = ("title", "anime", "name", "english title", "series")
 STATUS_MAP = {
@@ -51,11 +52,15 @@ def read_rows(path: Path):
                 .strip()
                 .casefold()
             )
+            genre_values = normalize_genres(
+                item.get("genres") or item.get("genre") or item.get("genre names")
+            )
             rows.append(
                 {
                     "title": title,
                     "normalized": normalize(title),
                     "status": STATUS_MAP.get(status_raw),
+                    "genres": genre_values,
                     "row": number,
                     "sheet": sheet.title,
                     "raw": item,
@@ -88,11 +93,7 @@ async def run(path: Path, dry_run: bool):
         for row in rows:
             raw = row["raw"]
             year = raw.get("year") or raw.get("release year")
-            genres = raw.get("genres") or raw.get("genre") or []
-            if isinstance(genres, str):
-                genres = [
-                    x.strip() for x in genres.replace(";", ",").split(",") if x.strip()
-                ]
+            genres = row["genres"]
             fields = {
                 "title": row["title"],
                 "title_norm": row["normalized"],
@@ -112,6 +113,13 @@ async def run(path: Path, dry_run: bool):
             )
             created += int(result.upserted_id is not None)
             anime = await db.anime.find_one({"title_norm": row["normalized"]})
+            if genres:
+                merged_genres = normalize_genres(genres_for(anime or {}), genres)
+                if merged_genres != genres_for(anime or {}):
+                    await db.anime.update_one(
+                        {"_id": anime["_id"]}, {"$set": {"genres": merged_genres}}
+                    )
+                    anime["genres"] = merged_genres
             if row["status"]:
                 # Status is inserted only when there is no pre-existing personal record.
                 await db.watchlist.update_one(
@@ -159,3 +167,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
