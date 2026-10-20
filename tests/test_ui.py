@@ -166,9 +166,9 @@ async def test_detail_screen_shows_change_status_instead_of_contradictory_status
     await _render_screen(update, context)
     markup = edit.await_args.kwargs["reply_markup"]
     labels = [button.text for button in _buttons(markup)]
-    assert "🔄 Change status" in labels
-    assert "✅ Completed" not in labels
-    assert "📌 Status: ✅ Completed" in edit.await_args.args[0]
+    assert "?? Change status" in labels
+    assert "? Completed" not in labels
+    assert "?? s????s: ? Completed" in edit.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -394,3 +394,4 @@ async def test_status_change_updates_existing_watchlist_row_once():
     assert await WatchlistService(db).set_status(7, str(aid), "completed") is False
     assert row["status"] == "completed"
     assert watch.activity_count == 1
+
