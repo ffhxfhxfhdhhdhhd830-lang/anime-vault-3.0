@@ -22,6 +22,7 @@ class Mongo:
 
 
 async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
+    await db.users.create_index("user_id", unique=True)
     await db.anime.create_index([("title_norm", 1), ("year", 1)])
     await db.anime.create_index([("aliases_norm", 1)])
     await db.watchlist.create_index([("user_id", 1), ("anime_id", 1)], unique=True)
@@ -32,3 +33,4 @@ async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     await db.audit.create_index([("at", -1)])
     await db.streaming.create_index([("anime_id", 1), ("region", 1)])
     await db.activity.create_index([("user_id", 1), ("at", -1)])
+
