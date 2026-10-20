@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from typing import Any
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
+from anime_bot.services.genres import genres_for
 
 STATUSES = (
     "plan",
@@ -201,19 +202,13 @@ class RecommendationService:
                 or (row.get("rating") or 0) >= 8
             ):
                 anime = await self.db.anime.find_one({"_id": row["anime_id"]})
-                genres = (anime or {}).get("genres", [])
-                if isinstance(genres, str):
-                    genres = [g.strip() for g in genres.replace(",", ";").split(";")]
-                liked_genres.update(str(g).casefold() for g in genres if str(g).strip())
+                liked_genres.update(g.casefold() for g in genres_for(anime or {}))
         candidates = await self.db.anime.find({}).limit(5000).to_list(5000)
         scored = []
         for anime in candidates:
             if str(anime["_id"]) in excluded:
                 continue
-            genres = anime.get("genres", [])
-            if isinstance(genres, str):
-                genres = [g.strip() for g in genres.replace(",", ";").split(";")]
-            normalized_genres = {str(g).casefold() for g in genres if str(g).strip()}
+            normalized_genres = {g.casefold() for g in genres_for(anime)}
             if genre and genre.casefold() not in normalized_genres:
                 continue
             overlap = liked_genres.intersection(normalized_genres)
@@ -299,3 +294,4 @@ async def seed_confirmed_titles(db: Any, owner_id: int) -> None:
             },
             upsert=True,
         )
+
