@@ -1,12 +1,13 @@
 import html
 import logging
+import asyncio
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
 from bson import ObjectId
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from anime_bot.config import get_settings
@@ -18,24 +19,32 @@ from anime_bot.services.core import (
     normalize,
     seed_confirmed_titles,
 )
+from anime_bot.services.genres import genres_for, normalize_genres
+from anime_bot.services.metadata import MetadataService
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 log = logging.getLogger("anime_bot")
 STATUS_LABELS = {
-    "plan": "📝 Plan to Watch",
-    "watching": "▶️ Watching",
-    "completed": "✅ Completed",
-    "on_hold": "⏸ On Hold",
-    "dropped": "❌ Dropped",
-    "rewatching": "🔁 Rewatching",
-    "not_interested": "🚫 Not Interested",
-    "unknown": "❔ Unknown",
+    "plan": "?? Plan to Watch",
+    "watching": "?? Watching",
+    "completed": "? Completed",
+    "on_hold": "? On Hold",
+    "dropped": "? Dropped",
+    "rewatching": "?? Rewatching",
+    "not_interested": "?? Not Interested",
+    "unknown": "? Unknown",
 }
 STATUS_CHOICES = tuple(k for k in STATUS_LABELS if k != "unknown")
 PAGE_SIZE = 8
 MAX_CATALOGUE = 5000
+START_IMAGES = (
+    "https://graph.org/file/dc7fcd70a16a81e6da48f-b633fcf31d25c21088.jpg",
+    "https://graph.org/file/9cb5e9c3285fe51ef4b0f-7294b1a2290fdd2c38.jpg",
+)
+LOADING_FRAMES = ("???", "???", "???")
+LOADING_MESSAGES = {}
 
 
 def services(context):
@@ -84,8 +93,29 @@ async def allowed(
                 "Access denied. Use /request_access to ask the owner."
             )
         return False
+    if hasattr(db, "users"):
+        now = datetime.now(timezone.utc)
+        await db.users.update_one(
+            {"user_id": user.id},
+            {
+                "$set": {
+                    "user_id": user.id,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "username": user.username,
+                    "last_seen_at": now,
+                },
+                "$setOnInsert": {"registered_at": now},
+            },
+            upsert=True,
+        )
     if owner and not is_owner:
-        if update.effective_message:
+        if update.callback_query and callback_answered:
+            try:
+                await update.callback_query.edit_message_text("Owner only.")
+            except BadRequest:
+                pass
+        elif update.effective_message:
             await update.effective_message.reply_text("Owner only.")
         return False
     return True
@@ -124,6 +154,25 @@ async def render(update, text, markup=None):
                 return
             # For old messages that Telegram will not edit, fall back to one fresh screen.
             log.debug("Could not edit callback message, sending replacement: %s", exc)
+    key = _message_key(update)
+    target = LOADING_MESSAGES.pop(key, None)
+    if target:
+        try:
+            await target.edit_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).casefold():
+                return
+            try:
+                await target.delete()
+            except TelegramError:
+                pass
+            log.debug("Could not replace loading message: %s", exc)
     message = update.effective_message
     if message:
         await message.reply_text(
@@ -134,38 +183,143 @@ async def render(update, text, markup=None):
         )
 
 
+def _message_key(update):
+    chat = update.effective_chat
+    user = update.effective_user
+    return (chat.id if chat else 0, user.id if user else 0)
+
+
+async def _animate_loading(target, stop, label, interval=1.1):
+    frame_index = 1
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+        text = f"{LOADING_FRAMES[frame_index]}\n{label}"
+        frame_index = (frame_index + 1) % len(LOADING_FRAMES)
+        try:
+            await target.edit_text(text)
+        except RetryAfter as exc:
+            try:
+                await asyncio.wait_for(
+                    stop.wait(), timeout=float(exc.retry_after) + 0.1
+                )
+            except asyncio.TimeoutError:
+                continue
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).casefold():
+                continue
+            return
+        except TelegramError:
+            return
+
+
+async def run_with_loading(update, context, operation, label="Loading.", threshold=0.8):
+    """Run an awaitable and animate only after it exceeds the short-operation threshold."""
+    lock = context.user_data.setdefault("_loading_lock", asyncio.Lock())
+    async with lock:
+        task = asyncio.create_task(operation())
+        target = None
+        stop = asyncio.Event()
+        animator = None
+        try:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=threshold)
+            except asyncio.TimeoutError:
+                if task.done():
+                    return task.result()
+            frame = f"{LOADING_FRAMES[0]}\n{label}"
+            query = update.callback_query
+            if query:
+                target = query.message
+                try:
+                    await query.edit_message_text(frame)
+                except BadRequest as exc:
+                    if "message is not modified" not in str(exc).casefold():
+                        log.debug("Could not show callback loading frame: %s", exc)
+            elif update.effective_message:
+                target = await update.effective_message.reply_text(frame)
+                LOADING_MESSAGES[_message_key(update)] = target
+            if target:
+                animator = asyncio.create_task(_animate_loading(target, stop, label))
+            return await task
+        except asyncio.CancelledError:
+            task.cancel()
+            if target:
+                if update.callback_query:
+                    try:
+                        await target.edit_text("Operation cancelled.")
+                    except TelegramError:
+                        pass
+                else:
+                    LOADING_MESSAGES.pop(_message_key(update), None)
+                    try:
+                        await target.delete()
+                    except TelegramError:
+                        pass
+            raise
+        finally:
+            stop.set()
+            if animator:
+                animator.cancel()
+                await asyncio.gather(animator, return_exceptions=True)
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+async def _render_current(update, context):
+    try:
+        return await run_with_loading(
+            update, context, lambda: _render_screen(update, context), "Loading."
+        )
+    except Exception as exc:
+        log.warning("Could not render screen (%s)", type(exc).__name__)
+        return await render(
+            update,
+            "<b><blockquote>?? ?????? ?? ????</blockquote></b>\nPlease try again.",
+            home_markup(),
+        )
+
+
 def home_markup():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🎌 Search", callback_data="v1:search"),
-                InlineKeyboardButton("📚 Watchlist", callback_data="v1:watchlist"),
+                InlineKeyboardButton("?? Search", callback_data="v1:search"),
+                InlineKeyboardButton("?? Watchlist", callback_data="v1:watchlist"),
             ],
             [
                 InlineKeyboardButton(
-                    "▶️ Watching", callback_data="v1:statuslist:watching"
+                    "?? Watching", callback_data="v1:statuslist:watching"
                 ),
                 InlineKeyboardButton(
-                    "✅ Completed", callback_data="v1:statuslist:completed"
+                    "? Completed", callback_data="v1:statuslist:completed"
                 ),
             ],
             [
-                InlineKeyboardButton("📝 Plan", callback_data="v1:statuslist:plan"),
+                InlineKeyboardButton("?? Plan", callback_data="v1:statuslist:plan"),
                 InlineKeyboardButton(
-                    "⏸ On Hold", callback_data="v1:statuslist:on_hold"
+                    "? On Hold", callback_data="v1:statuslist:on_hold"
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "✨ Recommendations", callback_data="v1:genres:recommend"
+                    "? Recommendations", callback_data="v1:genres:recommend"
                 ),
-                InlineKeyboardButton("⭐ Top by genre", callback_data="v1:genres:top"),
+                InlineKeyboardButton("? Top by genre", callback_data="v1:genres:top"),
             ],
             [
-                InlineKeyboardButton("🎬 Movies", callback_data="v1:genres:movie"),
-                InlineKeyboardButton("📺 Series", callback_data="v1:genres:series"),
+                InlineKeyboardButton("?? Movies", callback_data="v1:genres:movie"),
+                InlineKeyboardButton("?? Series", callback_data="v1:genres:series"),
             ],
-            [InlineKeyboardButton("📊 Statistics", callback_data="v1:stats")],
+            [
+                InlineKeyboardButton("? Help", callback_data="v1:help"),
+                InlineKeyboardButton("?? About", callback_data="v1:about"),
+            ],
+            [InlineKeyboardButton("?? Statistics", callback_data="v1:stats")],
         ]
     )
 
@@ -173,17 +327,14 @@ def home_markup():
 def navigation_row(*, back=True, home=True):
     row = []
     if back:
-        row.append(InlineKeyboardButton("⬅️ Back", callback_data="v1:back"))
+        row.append(InlineKeyboardButton("?? Back", callback_data="v1:back"))
     if home:
-        row.append(InlineKeyboardButton("🏠 Home", callback_data="v1:home"))
+        row.append(InlineKeyboardButton("?? Home", callback_data="v1:home"))
     return [row] if row else []
 
 
 def _genre_values(anime):
-    genres = anime.get("genres") or []
-    if isinstance(genres, str):
-        genres = [g.strip() for g in genres.replace(",", ";").split(";")]
-    return [str(g).strip() for g in genres if str(g).strip()]
+    return genres_for(anime)
 
 
 def _format_kind(value):
@@ -231,7 +382,28 @@ async def _watch_map(db, user_id):
     return {str(row["anime_id"]): row for row in rows}
 
 
-async def screen_genres(db, screen, user_id):
+async def _registered_users(db):
+    """Merge the current user collection with legacy authorization/request records."""
+    merged = {}
+    for collection_name, query in (
+        ("users", {}),
+        ("authorized_users", {}),
+        ("access_requests", {}),
+    ):
+        collection = getattr(db, collection_name, None)
+        if collection is None:
+            continue
+        for row in await collection.find(query).to_list(10000):
+            if "user_id" not in row:
+                continue
+            user_id = int(row["user_id"])
+            merged.setdefault(user_id, {}).update(
+                {key: value for key, value in row.items() if value is not None}
+            )
+    return [merged[user_id] for user_id in sorted(merged)]
+
+
+async def screen_genres(db, screen, user_id, metadata=None):
     mode = screen["mode"]
     catalogue = await _catalogue(db)
     if mode in {"movie", "series"}:
@@ -239,6 +411,8 @@ async def screen_genres(db, screen, user_id):
     if mode == "recommend":
         watched = await _watch_map(db, user_id)
         catalogue = [a for a in catalogue if str(a["_id"]) not in watched]
+    if metadata:
+        await metadata.enrich_many(catalogue, limit=20)
     genre_to_ids = {}
     for anime in catalogue:
         for genre in _genre_values(anime):
@@ -247,7 +421,7 @@ async def screen_genres(db, screen, user_id):
     return [genre_to_ids[key] for key in sorted(genre_to_ids)]
 
 
-async def _list_titles(db, user_id, screen):
+async def _list_titles(db, user_id, screen, metadata=None):
     mode = screen["mode"]
     genre = screen.get("genre")
     if mode == "watchlist" or mode == "statuslist":
@@ -257,14 +431,19 @@ async def _list_titles(db, user_id, screen):
         return rows, "Your watchlist" if mode == "watchlist" else STATUS_LABELS.get(
             screen.get("status"), "Watchlist"
         )
-    if mode == "search":
+    if mode in {"search", "wtw"}:
         rows = await AnimeService(db).search(screen.get("query", ""), limit=100)
-        return _dedupe_titles(
-            rows
-        ), f"Search results for <b>{html.escape(screen.get('query', ''))}</b>"
+        heading = (
+            "Choose a title for Where to Watch"
+            if mode == "wtw"
+            else f"Search results for <b>{html.escape(screen.get('query', ''))}</b>"
+        )
+        return _dedupe_titles(rows), heading
     catalogue = await _catalogue(db)
     if mode in {"movie", "series"}:
         catalogue = [a for a in catalogue if _format_kind(a.get("format")) == mode]
+    if metadata:
+        await metadata.enrich_many(catalogue, limit=20)
     if genre:
         catalogue = [
             a
@@ -276,7 +455,7 @@ async def _list_titles(db, user_id, screen):
         values = await rec.recommend(user_id, limit=MAX_CATALOGUE, genre=genre)
         return [
             a for a, _ in values
-        ], f"Recommendations · {html.escape(genre or 'all genres')}"
+        ], f"Recommendations � {html.escape(genre or 'all genres')}"
     if mode == "top":
         watches = await _watch_map(db, user_id)
         rated = []
@@ -306,10 +485,10 @@ async def _list_titles(db, user_id, screen):
             )
             else "Verified IMDb ratings"
         )
-        return [a for _, a in rated], f"{label} · {html.escape(genre or '')}"
+        return [a for _, a in rated], f"{label} � {html.escape(genre or '')}"
     catalogue.sort(key=lambda a: str(a.get("title", "")).casefold())
     heading = {"movie": "Movies", "series": "Series"}.get(mode, "Anime")
-    return catalogue, f"{heading} · {html.escape(genre or 'all genres')}"
+    return catalogue, f"{heading} � {html.escape(genre or 'all genres')}"
 
 
 def _title_keyboard(rows, page, mode):
@@ -321,7 +500,7 @@ def _title_keyboard(rows, page, mode):
         year = anime.get("year")
         label = f"{title} ({year})" if year else title
         if anime.get("_display_rating") is not None:
-            label += f" · ⭐ {anime['_display_rating']:g}/10"
+            label += f" � ? {anime['_display_rating']:g}/10"
         button = InlineKeyboardButton(
             label[:60], callback_data=f"v1:anime:{anime['_id']}"
         )
@@ -353,7 +532,7 @@ def _title_keyboard(rows, page, mode):
         pages = []
         if page > 0:
             pages.append(
-                InlineKeyboardButton("⬅️ Previous", callback_data=f"v1:page:{page - 1}")
+                InlineKeyboardButton("?? Previous", callback_data=f"v1:page:{page - 1}")
             )
         pages.append(
             InlineKeyboardButton(
@@ -362,26 +541,106 @@ def _title_keyboard(rows, page, mode):
         )
         if page + 1 < page_count:
             pages.append(
-                InlineKeyboardButton("Next ➡️", callback_data=f"v1:page:{page + 1}")
+                InlineKeyboardButton("Next ??", callback_data=f"v1:page:{page + 1}")
             )
         keyboard.append(pages)
     keyboard.extend(navigation_row())
     return InlineKeyboardMarkup(keyboard)
 
 
+def _wtw_screen(title, offers):
+    lines = [
+        "<b><blockquote>?? ????? ?? ?????</blockquote></b>",
+        f"{html.escape(str(title or 'Untitled'))} � Region {html.escape(offers['region'])}",
+    ]
+    buttons = []
+    if offers["available"]:
+        lines.append("<b>Verified provider listings</b>")
+        lines.extend(
+            f" {html.escape(item['name'])} � {html.escape(item['type'].title())}"
+            for item in offers["offers"]
+        )
+        if offers.get("link"):
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "Open TMDb provider listings", url=offers["link"]
+                    )
+                ]
+            )
+    else:
+        lines.append(
+            "No verified streaming offers could be retrieved for this title and region."
+        )
+    query = quote_plus(str(title or ""))
+    buttons.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "Search Netflix", url=f"https://www.netflix.com/search?q={query}"
+                ),
+                InlineKeyboardButton(
+                    "Search Crunchyroll",
+                    url=f"https://www.crunchyroll.com/search?q={query}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Search Prime Video",
+                    url=f"https://www.primevideo.com/search?phrase={query}",
+                )
+            ],
+        ]
+    )
+    lines.append(
+        "Search buttons open the service's title search; they do not confirm availability."
+    )
+    buttons.extend(navigation_row())
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
 async def _render_screen(update, context):
     db = context.application.bot_data["db"]
+    metadata = context.application.bot_data.get("metadata")
     uid = update.effective_user.id
     screen = current_ui(context)["current"]
     kind = screen["kind"]
     if kind == "home":
         return await render(
             update,
-            "🎌 <b>Anime Command Center</b>\nYour private anime tracker. Choose an action:",
+            "?? <b>Anime Command Center</b>\nYour private anime tracker. Choose an action:",
             home_markup(),
         )
+    if kind == "help":
+        return await render(
+            update,
+            help_text(),
+            InlineKeyboardMarkup(navigation_row()),
+        )
+    if kind == "about":
+        return await render(
+            update,
+            await about_text(context),
+            InlineKeyboardMarkup(navigation_row()),
+        )
+    if kind == "wtw_search_empty":
+        return await render(
+            update,
+            f"No local catalogue match for <b>{html.escape(str(screen.get('query', '')))}</b>. Add the title with /add, then try /wtw again.",
+            InlineKeyboardMarkup(navigation_row()),
+        )
+    if kind == "wtw_external":
+        title = str(screen.get("title", ""))
+        region = context.application.bot_data["settings"].default_region
+        offers = (
+            await metadata.watch_offers({"title": title, "format": "unknown"}, region)
+            if metadata
+            else {"region": region, "offers": [], "available": False}
+        )
+        text, markup = _wtw_screen(title, offers)
+        return await render(update, text, markup)
     if kind == "genres":
-        genres = await screen_genres(db, screen, uid)
+        genres = await screen_genres(db, screen, uid, metadata)
         if not genres:
             return await render(
                 update,
@@ -400,7 +659,7 @@ async def _render_screen(update, context):
             if page > 0:
                 pages.append(
                     InlineKeyboardButton(
-                        "⬅️ Previous", callback_data=f"v1:gpage:{page - 1}"
+                        "?? Previous", callback_data=f"v1:gpage:{page - 1}"
                     )
                 )
             pages.append(
@@ -411,7 +670,7 @@ async def _render_screen(update, context):
             )
             if first + PAGE_SIZE < len(genres):
                 pages.append(
-                    InlineKeyboardButton("Next ➡️", callback_data=f"v1:gpage:{page + 1}")
+                    InlineKeyboardButton("Next ??", callback_data=f"v1:gpage:{page + 1}")
                 )
             keyboard.append(pages)
         keyboard.extend(navigation_row())
@@ -422,10 +681,12 @@ async def _render_screen(update, context):
             "series": "Choose a series genre",
         }.get(screen["mode"], "Choose a genre")
         return await render(
-            update, f"🎭 <b>{title}</b>", InlineKeyboardMarkup(keyboard)
+            update,
+            f"<b><blockquote>?? {title}</blockquote></b>",
+            InlineKeyboardMarkup(keyboard),
         )
     if kind == "titles":
-        rows, heading = await _list_titles(db, uid, screen)
+        rows, heading = await _list_titles(db, uid, screen, metadata)
         rows = _dedupe_titles(rows)
         if not rows:
             if screen["mode"] == "top":
@@ -436,7 +697,7 @@ async def _render_screen(update, context):
                 message = "No titles found here yet."
             return await render(
                 update,
-                f"<b>{heading}</b>\n{message}",
+                f"<b><blockquote>{heading}</blockquote></b>\n{message}",
                 InlineKeyboardMarkup(navigation_row()),
             )
         page = max(0, min(int(screen.get("page", 0)), (len(rows) - 1) // PAGE_SIZE))
@@ -444,7 +705,7 @@ async def _render_screen(update, context):
         keyboard = _title_keyboard(rows, page, screen["mode"])
         return await render(
             update,
-            f"<b>{heading}</b> · {len(rows)} title(s)\nChoose a title:",
+            f"<b><blockquote>{heading}</blockquote></b> � {len(rows)} title(s)\nChoose a title:",
             keyboard,
         )
     if kind == "detail":
@@ -454,6 +715,8 @@ async def _render_screen(update, context):
             return await render(
                 update, "That catalogue title is no longer available.", home_markup()
             )
+        if metadata:
+            await metadata.enrich_genres(anime)
         entry = await db.watchlist.find_one({"user_id": uid, "anime_id": anime["_id"]})
         status = STATUS_LABELS.get(
             (entry or {}).get("status", "unknown"), STATUS_LABELS["unknown"]
@@ -464,19 +727,20 @@ async def _render_screen(update, context):
         )
         genres = ", ".join(_genre_values(anime)) or "Not available"
         lines = [
-            f"🎌 <b>{html.escape(str(anime.get('title', 'Untitled')))}</b>"
+            f"<b><blockquote>?? {html.escape(str(anime.get('title', 'Untitled')))}"
             + (f" ({html.escape(str(anime['year']))})" if anime.get("year") else ""),
-            f"🎬 Format: {html.escape(str(anime.get('format', 'Unknown')))}",
-            f"🎭 Genres: {html.escape(genres)}",
-            f"📌 Status: {status}",
+            "</blockquote></b>",
+            f"?? ??????: {html.escape(str(anime.get('format', 'Unknown')))}",
+            f"?? ?????s: {html.escape(genres)}",
+            f"?? s????s: {status}",
         ]
         if rating is not None:
-            lines.append(f"⭐ My rating: {html.escape(str(rating))}/10")
+            lines.append(f"? My rating: {html.escape(str(rating))}/10")
         elif _verified_catalogue_rating(anime) is not None:
-            lines.append(f"⭐ IMDb: {_verified_catalogue_rating(anime):g}/10")
+            lines.append(f"? IMDb: {_verified_catalogue_rating(anime):g}/10")
         if progress:
             lines.append(
-                f"📺 Episodes watched: {progress.get('episodes_completed', 0)}"
+                f"?? Episodes watched: {progress.get('episodes_completed', 0)}"
             )
         lines.append(
             html.escape(str(anime.get("synopsis") or "Synopsis unavailable.")[:700])
@@ -484,7 +748,7 @@ async def _render_screen(update, context):
         buttons = [
             [
                 InlineKeyboardButton(
-                    "🔄 Change status", callback_data=f"v1:status:{anime['_id']}"
+                    "?? Change status", callback_data=f"v1:status:{anime['_id']}"
                 )
             ]
         ]
@@ -493,10 +757,10 @@ async def _render_screen(update, context):
                 0,
                 [
                     InlineKeyboardButton(
-                        "➕ Episode", callback_data=f"v1:progress:{anime['_id']}:1"
+                        "? Episode", callback_data=f"v1:progress:{anime['_id']}:1"
                     ),
                     InlineKeyboardButton(
-                        "➖ Episode", callback_data=f"v1:progress:{anime['_id']}:-1"
+                        "? Episode", callback_data=f"v1:progress:{anime['_id']}:-1"
                     ),
                 ],
             )
@@ -507,7 +771,71 @@ async def _render_screen(update, context):
             else "https://www.imdb.com/find/?q="
             + quote_plus(str(anime.get("title", "")))
         )
-        buttons.append([InlineKeyboardButton("🌐 IMDb", url=url)])
+        buttons.append([InlineKeyboardButton("?? IMDb", url=url)])
+        buttons.extend(navigation_row())
+        return await render(update, "\n".join(lines), InlineKeyboardMarkup(buttons))
+    if kind == "wtw_offer":
+        anime = await db.anime.find_one({"_id": ObjectId(screen["anime_id"])})
+        if not anime:
+            return await render(
+                update,
+                "That catalogue title is no longer available.",
+                InlineKeyboardMarkup(navigation_row()),
+            )
+        region = context.application.bot_data["settings"].default_region
+        offers = (
+            await metadata.watch_offers(anime, region)
+            if metadata
+            else {"region": region, "offers": [], "available": False}
+        )
+        title = html.escape(str(anime.get("title", "Untitled")))
+        lines = [
+            "<b><blockquote>?? ????? ?? ?????</blockquote></b>",
+            f"{title} � Region {html.escape(offers['region'])}",
+        ]
+        buttons = []
+        if offers["available"]:
+            lines.append("<b>Verified provider listings</b>")
+            lines.extend(
+                f" {html.escape(item['name'])} � {html.escape(item['type'].title())}"
+                for item in offers["offers"]
+            )
+            if offers.get("link"):
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            "Open TMDb provider listings", url=offers["link"]
+                        )
+                    ]
+                )
+        else:
+            lines.append(
+                "No verified streaming offers could be retrieved for this title and region."
+            )
+        query = quote_plus(str(anime.get("title", "")))
+        buttons.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Search Netflix",
+                        url=f"https://www.netflix.com/search?q={query}",
+                    ),
+                    InlineKeyboardButton(
+                        "Search Crunchyroll",
+                        url=f"https://www.crunchyroll.com/search?q={query}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Search Prime Video",
+                        url=f"https://www.primevideo.com/search?phrase={query}",
+                    )
+                ],
+            ]
+        )
+        lines.append(
+            "Search buttons open the service's title search; they do not confirm availability."
+        )
         buttons.extend(navigation_row())
         return await render(update, "\n".join(lines), InlineKeyboardMarkup(buttons))
     if kind == "status":
@@ -523,7 +851,7 @@ async def _render_screen(update, context):
         keyboard = [
             [
                 InlineKeyboardButton(
-                    ("✓ " if current == status else "") + STATUS_LABELS[status],
+                    ("� " if current == status else "") + STATUS_LABELS[status],
                     callback_data=f"v1:set:{status}:{anime['_id']}",
                 )
             ]
@@ -533,7 +861,7 @@ async def _render_screen(update, context):
         keyboard.extend(navigation_row())
         return await render(
             update,
-            f"<b>{html.escape(anime.get('title', 'Untitled'))}</b>\nCurrent status: {STATUS_LABELS.get(current, STATUS_LABELS['unknown'])}\nChoose the new status:",
+            f"<b><blockquote>{html.escape(anime.get('title', 'Untitled'))}</blockquote></b>\nCurrent status: {STATUS_LABELS.get(current, STATUS_LABELS['unknown'])}\nChoose the new status:",
             InlineKeyboardMarkup(keyboard),
         )
     if kind == "stats":
@@ -549,21 +877,227 @@ async def _render_screen(update, context):
         ).to_list(1)
         total = await db.anime.count_documents({})
         text = (
-            f"📊 <b>Your stats</b>\nCatalogue: {total}\nCompleted: {counts['completed']}\nWatching: {counts['watching']}\n"
+            f"<b><blockquote>?? ???? s???s</blockquote></b>\nCatalogue: {total}\nCompleted: {counts['completed']}\nWatching: {counts['watching']}\n"
             f"Plan to watch: {counts['plan']}\nOn hold: {counts['on_hold']}\nDropped: {counts['dropped']}\nEpisodes watched: {prog[0]['episodes'] if prog else 0}"
         )
         return await render(update, text, InlineKeyboardMarkup(navigation_row()))
+    if kind in {"users", "pending_users"}:
+        settings = context.application.bot_data["settings"]
+        if uid != settings.owner_telegram_id:
+            return await render(
+                update, "<b><blockquote>Owner only.</blockquote></b>", home_markup()
+            )
+        if kind == "pending_users":
+            rows = (
+                await db.access_requests.find({"status": "pending"})
+                .sort("at", 1)
+                .to_list(5000)
+            )
+            title = "? Pending access requests"
+        else:
+            rows = await _registered_users(db)
+            authorized_count = await db.authorized_users.count_documents(
+                {"blocked": {"$ne": True}}
+            )
+            title = f"?? Registered users: {len(rows)} � Authorized: {authorized_count}"
+        if not rows:
+            return await render(
+                update,
+                f"<b><blockquote>{html.escape(title)}</blockquote></b>\nNo records found.",
+                InlineKeyboardMarkup(navigation_row()),
+            )
+        page_size = 6
+        page = max(0, min(int(screen.get("page", 0)), (len(rows) - 1) // page_size))
+        screen["page"] = page
+        start = page * page_size
+        keyboard = []
+        lines = [f"<b><blockquote>{html.escape(title)}</blockquote></b>"]
+        for row in rows[start : start + page_size]:
+            user_id = int(row["user_id"])
+            display_name = " ".join(
+                filter(
+                    None, [row.get("first_name"), row.get("last_name"), row.get("name")]
+                )
+            )
+            username = row.get("username")
+            label = html.escape(display_name or "Name unavailable")
+            if username:
+                label += " � @" + html.escape(str(username))
+            lines.append(f" <code>{user_id}</code> � {label}")
+            if kind == "pending_users":
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            "? Approve", callback_data=f"v1:request:approve:{user_id}"
+                        ),
+                        InlineKeyboardButton(
+                            "? Reject", callback_data=f"v1:request:reject:{user_id}"
+                        ),
+                    ]
+                )
+        if len(rows) > page_size:
+            pages = []
+            if page:
+                pages.append(
+                    InlineKeyboardButton(
+                        "?? Previous", callback_data=f"v1:adminpage:{kind}:{page - 1}"
+                    )
+                )
+            pages.append(
+                InlineKeyboardButton(
+                    f"{page + 1}/{(len(rows) + page_size - 1) // page_size}",
+                    callback_data="v1:adminpage:noop",
+                )
+            )
+            if start + page_size < len(rows):
+                pages.append(
+                    InlineKeyboardButton(
+                        "Next ??", callback_data=f"v1:adminpage:{kind}:{page + 1}"
+                    )
+                )
+            keyboard.append(pages)
+        keyboard.extend(navigation_row())
+        return await render(update, "\n".join(lines), InlineKeyboardMarkup(keyboard))
     return await render(update, "That screen is unavailable.", home_markup())
 
 
 async def _open(update, context, screen, reset=False):
     _set_current(context, screen, push=not reset, reset=reset)
-    await _render_screen(update, context)
+    await _render_current(update, context)
+
+
+def welcome_text(first_name):
+    name = html.escape(first_name or "darling", quote=True)
+    return (
+        "<b><blockquote>????? ?? ??????? "
+        f"{name} ??,</blockquote>\n"
+        "   ?'? ? ???????? ????? ????? ?? ?? "
+        '<a href="https://t.me/Nobita_MUI">?????</a> , ??? ????? ? ???? ???? ??? ?? ??? ???? ?? ?????? ??? ???? ??? ??? ??Q???? ?? '
+        '<a href="https://t.me/Nobita_MUI">?????</a> , ?? ??????? ?? /request_access !</b>'
+    )
+
+
+def help_text():
+    return (
+        "<b><blockquote>? ???? &amp; ???????s</blockquote></b>\n"
+        "<b>????????</b>\n"
+        "/start � /help � /about � /request_access\n"
+        "/search &lt;title&gt; � /add &lt;title&gt; [| genres]\n"
+        "/watchlist � /watching � /completed � /plan � /onhold � /dropped\n"
+        "/recommendations � /top � /movies � /series\n"
+        "/wtw &lt;title&gt; � /progress � /continue � /stats � /export\n\n"
+        "<b>????? ????</b>\n"
+        "/users � /pending_users � /allow &lt;id&gt; � /deny &lt;id&gt;\n"
+        "/approve &lt;id&gt; � /reject &lt;id&gt; � /block &lt;id&gt; � /unblock &lt;id&gt; � /health"
+    )
+
+
+async def about_text(context):
+    try:
+        bot = await context.bot.get_me()
+        username = bot.username
+        bot_name = bot.first_name or "Anime Command Center"
+    except TelegramError:
+        username = None
+        bot_name = "Anime Command Center"
+    safe_name = html.escape(str(bot_name), quote=True)
+    safe_username = html.escape(str(username or ""), quote=True)
+    linked_name = (
+        f'<a href="https://t.me/{safe_username}">{safe_name}</a>'
+        if username
+        else safe_name
+    )
+    provider = html.escape(
+        context.application.bot_data["settings"].deployment_provider, quote=True
+    )
+    return (
+        "<b><blockquote>?���[ ?? ??????? ]���?</blockquote>\n\n"
+        f"? ?? ???? : {linked_name}\n"
+        '? ?? ??????? : <a href="tg://settings">?? ???????</a>\n'
+        '? ????????? : <a href="https://t.me/Nobita_MUI">?????</a>\n'
+        '? ??????? : <a href="https://docs.python-telegram-bot.org/en/v22.5/">python-telegram-bot 22.5</a>\n'
+        '? ???????? : <a href="https://www.python.org/download/releases/3.0/">?????? 3</a>\n'
+        '? ???? ??s? : <a href="https://www.mongodb.com/">????? ??</a>\n'
+        f"? ??? s????? : {provider}\n"
+        "? ????? s????s : ?2.7.1 [s?????]</b>"
+    )
 
 
 async def start(update, context):
-    if await allowed(update, context):
-        await _open(update, context, {"kind": "home"}, reset=True)
+    user = update.effective_user
+    chat = update.effective_chat
+    settings = context.application.bot_data["settings"]
+    if not user or not chat:
+        return
+    if chat.type != "private" and not settings.allow_groups:
+        return await update.effective_message.reply_text(
+            "Please use me in a private chat."
+        )
+    db = context.application.bot_data["db"]
+    now = datetime.now(timezone.utc)
+    await db.users.update_one(
+        {"user_id": user.id},
+        {
+            "$set": {
+                "user_id": user.id,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "username": user.username,
+                "last_seen_at": now,
+            },
+            "$setOnInsert": {"registered_at": now},
+        },
+        upsert=True,
+    )
+    existing = await db.users.find_one({"user_id": user.id}) or {}
+    welcome = welcome_text(user.first_name)
+    old_message_id = existing.get("start_message_id")
+    if old_message_id and existing.get("start_chat_id") == chat.id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat.id,
+                message_id=old_message_id,
+                text=welcome,
+                parse_mode=ParseMode.HTML,
+                reply_markup=home_markup(),
+                disable_web_page_preview=True,
+            )
+            return
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).casefold():
+                return
+    if not existing.get("start_album_attempted"):
+        album_sent = False
+        try:
+            await context.bot.send_media_group(
+                chat_id=chat.id,
+                media=[InputMediaPhoto(media=url) for url in START_IMAGES],
+            )
+            album_sent = True
+        except TelegramError as exc:
+            log.warning("Start image album was unavailable (%s)", type(exc).__name__)
+            # Telegram may reject an album if one URL is unavailable; try each URL
+            # independently so one working image can still be displayed.
+            for url in START_IMAGES:
+                try:
+                    await context.bot.send_photo(chat_id=chat.id, photo=url)
+                    album_sent = True
+                except TelegramError:
+                    continue
+        await db.users.update_one(
+            {"user_id": user.id},
+            {"$set": {"start_album_attempted": True, "start_album_sent": album_sent}},
+        )
+    message = await update.effective_message.reply_text(
+        welcome,
+        parse_mode=ParseMode.HTML,
+        reply_markup=home_markup(),
+        disable_web_page_preview=True,
+    )
+    await db.users.update_one(
+        {"user_id": user.id},
+        {"$set": {"start_chat_id": chat.id, "start_message_id": message.message_id}},
+    )
 
 
 async def whoami(update, context):
@@ -573,11 +1107,11 @@ async def whoami(update, context):
 
 
 async def help_cmd(update, context):
-    if not await allowed(update, context):
-        return
-    await update.effective_message.reply_text(
-        "Commands: /start /menu /search <title> /add <title> /watchlist /watching /completed /plan /onhold /dropped /random /recommend /recommendations /movies /series /progress /stats /top /favourites /continue /streaming <title> /settings /export /import <file.xlsx> /cancel /whoami\nOwner: /allow /deny /users /pending_users /approve /reject /block /unblock /health"
-    )
+    await _open(update, context, {"kind": "help"}, reset=True)
+
+
+async def about_cmd(update, context):
+    await _open(update, context, {"kind": "about"}, reset=True)
 
 
 async def menu(update, context):
@@ -618,14 +1152,24 @@ async def search(update, context):
 async def add(update, context):
     if not await allowed(update, context):
         return
-    title = " ".join(context.args).strip()
+    raw_title = " ".join(context.args).strip()
+    title, separator, raw_genres = raw_title.partition("|")
+    title = title.strip()
+    manual_genres = normalize_genres(raw_genres) if separator else []
     if not title:
         return await update.effective_message.reply_text("Use /add <title>")
     db, anime_svc, _, _ = services(context)
     results = await anime_svc.search(title, limit=5)
     exact = next((x for x in results if x.get("title_norm") == normalize(title)), None)
     if exact:
+        if manual_genres:
+            merged = normalize_genres(genres_for(exact), manual_genres)
+            if merged != genres_for(exact):
+                await db.anime.update_one(
+                    {"_id": exact["_id"]}, {"$set": {"genres": merged}}
+                )
         return await show_anime(update, context, exact)
+    genres = manual_genres
     await db.anime.update_one(
         {"title_norm": normalize(title)},
         {
@@ -633,7 +1177,7 @@ async def add(update, context):
                 "title": title,
                 "title_norm": normalize(title),
                 "format": "unknown",
-                "genres": [],
+                "genres": genres,
                 "metadata_source": "user entry",
                 "created_at": datetime.now(timezone.utc),
             }
@@ -641,6 +1185,12 @@ async def add(update, context):
         upsert=True,
     )
     anime = await db.anime.find_one({"title_norm": normalize(title)})
+    if genres:
+        merged = normalize_genres(genres_for(anime or {}), genres)
+        if merged != genres_for(anime or {}):
+            await db.anime.update_one(
+                {"_id": anime["_id"]}, {"$set": {"genres": merged}}
+            )
     await _open(
         update, context, {"kind": "detail", "anime_id": str(anime["_id"])}, reset=True
     )
@@ -681,9 +1231,13 @@ async def callbacks(update, context):
     query = update.callback_query
     # Answer promptly so Telegram clears its loading indicator before DB work.
     await query.answer()
+    data = query.data or ""
+    if data == "v1:help":
+        return await _open(update, context, {"kind": "help"})
+    if data == "v1:about":
+        return await _open(update, context, {"kind": "about"})
     if not await allowed(update, context, callback_answered=True):
         return
-    data = query.data or ""
     if len(data.encode("utf-8")) > 64 or not data.startswith("v1:"):
         return await render(
             update, "This action expired. Open the menu and try again.", home_markup()
@@ -697,7 +1251,7 @@ async def callbacks(update, context):
             return await _open(update, context, {"kind": "home"}, reset=True)
         if action == "back":
             ui["current"] = ui["back"].pop() if ui["back"] else {"kind": "home"}
-            return await _render_screen(update, context)
+            return await _render_current(update, context)
         if (
             action == "genres"
             and len(parts) == 3
@@ -729,7 +1283,7 @@ async def callbacks(update, context):
             screen = dict(ui["current"])
             screen["page"] = max(0, int(parts[2]))
             _set_current(context, screen, push=False)
-            return await _render_screen(update, context)
+            return await _render_current(update, context)
         if action in {"watchlist", "statuslist"}:
             if action == "watchlist":
                 return await _open(
@@ -749,6 +1303,12 @@ async def callbacks(update, context):
             anime = await db.anime.find_one({"_id": ObjectId(parts[2])})
             if not anime:
                 raise ValueError("Title no longer exists")
+            if ui["current"].get("mode") == "wtw":
+                return await _open(
+                    update,
+                    context,
+                    {"kind": "wtw_offer", "anime_id": str(anime["_id"])},
+                )
             return await _open(
                 update, context, {"kind": "detail", "anime_id": str(anime["_id"])}
             )
@@ -776,7 +1336,7 @@ async def callbacks(update, context):
             await WatchlistService(db).progress(
                 update.effective_user.id, aid, increment, anime.get("episodes")
             )
-            return await _render_screen(update, context)
+            return await _render_current(update, context)
         if action == "set" and len(parts) == 4 and ObjectId.is_valid(parts[3]):
             status, aid = parts[2], parts[3]
             if (
@@ -789,7 +1349,7 @@ async def callbacks(update, context):
             ui["current"] = (
                 ui["back"].pop() if ui["back"] else {"kind": "detail", "anime_id": aid}
             )
-            return await _render_screen(update, context)
+            return await _render_current(update, context)
         if (
             action == "page"
             and len(parts) == 3
@@ -800,9 +1360,36 @@ async def callbacks(update, context):
             screen = dict(ui["current"])
             screen["page"] = max(0, int(parts[2]))
             _set_current(context, screen, push=False)
-            return await _render_screen(update, context)
+            return await _render_current(update, context)
         if action == "stats":
             return await _open(update, context, {"kind": "stats"})
+        if action in {"users", "pending_users"}:
+            if not await allowed(update, context, owner=True, callback_answered=True):
+                return
+            return await _open(update, context, {"kind": action, "page": 0})
+        if action == "adminpage" and len(parts) == 4:
+            if not await allowed(update, context, owner=True, callback_answered=True):
+                return
+            if parts[2] == "noop":
+                return
+            kind = parts[2]
+            if kind not in {"users", "pending_users"}:
+                raise ValueError("Invalid admin screen")
+            _set_current(
+                context, {"kind": kind, "page": max(0, int(parts[3]))}, push=False
+            )
+            return await _render_current(update, context)
+        if action == "request" and len(parts) == 4:
+            if not await allowed(update, context, owner=True, callback_answered=True):
+                return
+            choice, target_id = parts[2], int(parts[3])
+            if (
+                choice not in {"approve", "reject"}
+                or ui["current"].get("kind") != "pending_users"
+            ):
+                raise ValueError("Request action is no longer active")
+            await _apply_request(db, target_id, choice, update.effective_user.id)
+            return await _render_current(update, context)
         if action == "search":
             return await render(
                 update,
@@ -825,16 +1412,87 @@ async def request_access(update, context):
     await db.access_requests.update_one(
         {"user_id": user.id},
         {
+            "$set": {
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "username": user.username,
+                "name": user.full_name,
+            },
             "$setOnInsert": {
                 "user_id": user.id,
-                "name": user.full_name,
                 "at": datetime.now(timezone.utc),
                 "status": "pending",
-            }
+            },
         },
         upsert=True,
     )
     await update.message.reply_text("Access request recorded. The owner can review it.")
+
+
+async def _apply_request(db, uid, choice, actor):
+    now = datetime.now(timezone.utc)
+    if choice == "approve":
+        await db.authorized_users.update_one(
+            {"user_id": uid},
+            {
+                "$set": {
+                    "user_id": uid,
+                    "blocked": False,
+                    "authorized_at": now,
+                    "authorized_by": actor,
+                }
+            },
+            upsert=True,
+        )
+        status = "approved"
+    else:
+        status = "rejected"
+    await db.access_requests.update_one(
+        {"user_id": uid},
+        {"$set": {"status": status, "reviewed_at": now, "reviewed_by": actor}},
+    )
+    await db.audit.insert_one(
+        {"actor_id": actor, "action": status, "target_id": uid, "at": now}
+    )
+
+
+async def users_cmd(update, context):
+    if await allowed(update, context, owner=True):
+        await _open(update, context, {"kind": "users", "page": 0}, reset=True)
+
+
+async def pending_users_cmd(update, context):
+    if await allowed(update, context, owner=True):
+        await _open(update, context, {"kind": "pending_users", "page": 0}, reset=True)
+
+
+async def wtw_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    title = " ".join(context.args).strip()
+    if not title:
+        return await update.effective_message.reply_text("Use /wtw <title>")
+    anime_svc = services(context)[1]
+
+    async def operation():
+        rows = _dedupe_titles(await anime_svc.search(title, limit=100))
+        if not rows:
+            _set_current(context, {"kind": "wtw_external", "title": title}, reset=True)
+        elif len(rows) == 1:
+            _set_current(
+                context,
+                {"kind": "wtw_offer", "anime_id": str(rows[0]["_id"])},
+                reset=True,
+            )
+        else:
+            _set_current(
+                context,
+                {"kind": "titles", "mode": "wtw", "query": title, "page": 0},
+                reset=True,
+            )
+        return await _render_screen(update, context)
+
+    await run_with_loading(update, context, operation, "Searching provider listings.")
 
 
 async def admin(update, context):
@@ -905,29 +1563,44 @@ async def export_cmd(update, context):
         return
     import json
 
-    rows = (
-        await context.application.bot_data["db"]
-        .watchlist.find({"user_id": update.effective_user.id})
-        .to_list(5000)
-    )
-    payload = []
-    for row in rows:
-        anime = await context.application.bot_data["db"].anime.find_one(
-            {"_id": row["anime_id"]}
+    db = context.application.bot_data["db"]
+
+    async def make_export():
+        rows = await db.watchlist.find({"user_id": update.effective_user.id}).to_list(
+            5000
         )
-        payload.append(
-            {
-                "title": (anime or {}).get("title"),
-                "status": row.get("status"),
-                "rating": row.get("rating"),
-                "favourite": row.get("favourite"),
-                "notes": row.get("notes"),
-                "review": row.get("review"),
-            }
+        payload = []
+        for row in rows:
+            anime = await db.anime.find_one({"_id": row["anime_id"]})
+            payload.append(
+                {
+                    "title": (anime or {}).get("title"),
+                    "status": row.get("status"),
+                    "rating": row.get("rating"),
+                    "favourite": row.get("favourite"),
+                    "notes": row.get("notes"),
+                    "review": row.get("review"),
+                }
+            )
+        return json.dumps(payload, ensure_ascii=False, indent=2).encode()
+
+    try:
+        content = await run_with_loading(
+            update, context, make_export, "Preparing your export."
         )
+    except Exception as exc:
+        log.warning("Export failed (%s)", type(exc).__name__)
+        await render(update, "?? Could not prepare your export. Please try again.")
+        return
+    placeholder = LOADING_MESSAGES.pop(_message_key(update), None)
+    if placeholder:
+        try:
+            await placeholder.delete()
+        except TelegramError:
+            pass
     from io import BytesIO
 
-    doc = BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode())
+    doc = BytesIO(content)
     doc.name = "anime_watchlist.json"
     await update.message.reply_document(doc, caption="Your personal watchlist export")
 
@@ -945,6 +1618,10 @@ async def post_init(app):
     await mongo.start()
     app.bot_data["mongo"] = mongo
     app.bot_data["db"] = mongo.db
+    settings = app.bot_data["settings"]
+    app.bot_data["metadata"] = MetadataService(
+        mongo.db, settings.tmdb_api_key.get_secret_value()
+    )
     await mongo.db.authorized_users.update_one(
         {"user_id": settings.owner_telegram_id},
         {
@@ -960,6 +1637,8 @@ async def post_init(app):
 
 
 async def post_shutdown(app):
+    if app.bot_data.get("metadata"):
+        await app.bot_data["metadata"].close()
     if app.bot_data.get("mongo"):
         await app.bot_data["mongo"].close()
 
@@ -1002,6 +1681,7 @@ def build_app():
     commands = {
         "start": start,
         "help": help_cmd,
+        "about": about_cmd,
         "menu": menu,
         "whoami": whoami,
         "search": search,
@@ -1014,6 +1694,9 @@ def build_app():
         "dropped": lambda u, c: list_cmd(u, c, "dropped"),
         "recommend": recommendations,
         "recommendations": recommendations,
+        "wtw": wtw_cmd,
+        "users": users_cmd,
+        "pending_users": pending_users_cmd,
         "stats": stats,
         "movies": genre_command("movie"),
         "series": genre_command("series"),
@@ -1034,8 +1717,6 @@ def build_app():
     for name in (
         "allow",
         "deny",
-        "users",
-        "pending_users",
         "approve",
         "reject",
         "block",
@@ -1055,3 +1736,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
