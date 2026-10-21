@@ -307,6 +307,7 @@ def home_markup():
                 InlineKeyboardButton("🎌 Search", callback_data="v1:search"),
                 InlineKeyboardButton("📚 Watchlist", callback_data="v1:watchlist"),
             ],
+            [InlineKeyboardButton("⭐ Favorites", callback_data="v1:favorites")],
             [
                 InlineKeyboardButton(
                     "▶️ Watching", callback_data="v1:statuslist:watching"
@@ -440,13 +441,16 @@ async def screen_genres(db, screen, user_id, metadata=None):
 async def _list_titles(db, user_id, screen, metadata=None):
     mode = screen["mode"]
     genre = screen.get("genre")
-    if mode == "watchlist" or mode == "statuslist":
+    if mode in {"watchlist", "statuslist", "favorites"}:
         rows = await WatchlistService(db).list(
-            user_id, screen.get("status"), limit=MAX_CATALOGUE
+            user_id,
+            screen.get("status"),
+            limit=MAX_CATALOGUE,
+            favourite=True if mode == "favorites" else None,
         )
-        return rows, "Your watchlist" if mode == "watchlist" else STATUS_LABELS.get(
-            screen.get("status"), "Watchlist"
-        )
+        if mode == "favorites":
+            return rows, "Your favorites"
+        return rows, "Your watchlist" if mode == "watchlist" else STATUS_LABELS.get(screen.get("status"), "Watchlist")
     if mode in {"search", "wtw"}:
         rows = await AnimeService(db).search(screen.get("query", ""), limit=100)
         heading = (
@@ -762,6 +766,12 @@ async def _render_screen(update, context):
             html.escape(str(anime.get("synopsis") or "Synopsis unavailable.")[:700])
         )
         buttons = [
+            [InlineKeyboardButton(
+                "★ Remove favorite" if (entry or {}).get("favourite") else "☆ Add to favorites",
+                callback_data=f"v1:favorite:{anime['_id']}:{0 if (entry or {}).get('favourite') else 1}",
+            )],
+            [InlineKeyboardButton("⭐ Set my rating", callback_data=f"v1:rating:{anime['_id']}")],
+            [InlineKeyboardButton("📺 Where to watch", callback_data=f"v1:where:{anime['_id']}")],
             [
                 InlineKeyboardButton(
                     "🔄 Change status", callback_data=f"v1:status:{anime['_id']}"
@@ -790,6 +800,19 @@ async def _render_screen(update, context):
         buttons.append([InlineKeyboardButton("🌐 IMDb", url=url)])
         buttons.extend(navigation_row())
         return await render(update, "\n".join(lines), InlineKeyboardMarkup(buttons))
+    if kind == "rating":
+        anime = await db.anime.find_one({"_id": ObjectId(screen["anime_id"])})
+        if not anime:
+            return await render(update, "That catalogue title is no longer available.", home_markup())
+        entry = await db.watchlist.find_one({"user_id": uid, "anime_id": anime["_id"]})
+        current_rating = (entry or {}).get("rating")
+        keyboard = [
+            [InlineKeyboardButton(f"{'✓ ' if current_rating == rating else ''}{rating}", callback_data=f"v1:setrating:{anime['_id']}:{rating}") for rating in range(1, 6)],
+            [InlineKeyboardButton(f"{'✓ ' if current_rating == rating else ''}{rating}", callback_data=f"v1:setrating:{anime['_id']}:{rating}") for rating in range(6, 11)],
+            [InlineKeyboardButton("Clear rating", callback_data=f"v1:setrating:{anime['_id']}:0")],
+        ]
+        keyboard.extend(navigation_row())
+        return await render(update, f"Rate <b>{html.escape(anime.get('title', 'Untitled'))}</b> from 1 to 10:", InlineKeyboardMarkup(keyboard))
     if kind == "wtw_offer":
         anime = await db.anime.find_one({"_id": ObjectId(screen["anime_id"])})
         if not anime:
@@ -999,7 +1022,7 @@ def help_text():
         "<b>ᴛʀᴀᴄᴋɪɴɢ</b>\n"
         "/start · /help · /about · /request_access\n"
         "/search &lt;title&gt; · /add &lt;title&gt; [| genres]\n"
-        "/watchlist · /watching · /completed · /plan · /onhold · /dropped\n"
+        "/watchlist · /favorites · /watching · /completed · /plan · /onhold · /dropped\n"
         "/recommendations · /top · /movies · /series\n"
         "/wtw &lt;title&gt; · /progress · /continue · /stats · /export\n\n"
         "<b>ᴏᴡɴᴇʀ ᴏɴʟʏ</b>\n"
@@ -1224,6 +1247,11 @@ async def list_cmd(update, context, status=None):
     )
 
 
+async def favorites_cmd(update, context):
+    if await allowed(update, context):
+        await _open(update, context, {"kind": "titles", "mode": "favorites", "page": 0}, reset=True)
+
+
 async def recommendations(update, context):
     if not await allowed(update, context):
         return
@@ -1313,6 +1341,8 @@ async def callbacks(update, context):
                 context,
                 {"kind": "titles", "mode": "statuslist", "status": status, "page": 0},
             )
+        if action == "favorites":
+            return await _open(update, context, {"kind": "titles", "mode": "favorites", "page": 0})
         if action == "anime" and len(parts) == 3 and ObjectId.is_valid(parts[2]):
             if ui["current"].get("kind") != "titles":
                 raise ValueError("Title selection is no longer active")
@@ -1337,6 +1367,29 @@ async def callbacks(update, context):
             return await _open(
                 update, context, {"kind": "status", "anime_id": parts[2]}
             )
+        if action in {"rating", "where"} and len(parts) == 3 and ObjectId.is_valid(parts[2]):
+            aid = parts[2]
+            if ui["current"].get("kind") != "detail" or ui["current"].get("anime_id") != aid:
+                raise ValueError("Title action is no longer active")
+            if action == "rating":
+                return await _open(update, context, {"kind": "rating", "anime_id": aid})
+            return await _open(update, context, {"kind": "wtw_offer", "anime_id": aid})
+        if action == "favorite" and len(parts) == 4 and ObjectId.is_valid(parts[2]):
+            aid = parts[2]
+            if ui["current"].get("kind") != "detail" or ui["current"].get("anime_id") != aid or parts[3] not in {"0", "1"}:
+                raise ValueError("Favorite action is no longer active")
+            await WatchlistService(db).set_favourite(update.effective_user.id, aid, parts[3] == "1")
+            return await _render_current(update, context)
+        if action == "setrating" and len(parts) == 4 and ObjectId.is_valid(parts[2]):
+            aid = parts[2]
+            if ui["current"].get("kind") != "rating" or ui["current"].get("anime_id") != aid:
+                raise ValueError("Rating action is no longer active")
+            value = int(parts[3])
+            if value not in range(0, 11):
+                raise ValueError("Rating must be between 1 and 10")
+            await WatchlistService(db).set_rating(update.effective_user.id, aid, value or None)
+            ui["current"] = ui["back"].pop() if ui["back"] else {"kind": "detail", "anime_id": aid}
+            return await _render_current(update, context)
         if action == "progress" and len(parts) == 4 and ObjectId.is_valid(parts[2]):
             aid = parts[2]
             increment = int(parts[3])
@@ -1717,7 +1770,8 @@ def build_app():
         "movies": genre_command("movie"),
         "series": genre_command("series"),
         "top": genre_command("top"),
-        "favourites": lambda u, c: list_cmd(u, c, None),
+        "favorites": favorites_cmd,
+        "favourites": favorites_cmd,
         "progress": lambda u, c: list_cmd(u, c, "watching"),
         "continue": lambda u, c: list_cmd(u, c, "watching"),
         "streaming": _streaming_cmd,
