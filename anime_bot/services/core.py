@@ -117,12 +117,93 @@ class WatchlistService:
         )
         return True
 
+    async def set_favourite(self, user_id: int, anime_id: str, favourite: bool) -> bool:
+        if not ObjectId.is_valid(anime_id):
+            raise ValueError("Invalid anime id")
+        aid = ObjectId(anime_id)
+        if not await self.db.anime.find_one({"_id": aid}, {"_id": 1}):
+            raise ValueError("Anime not found")
+        now = datetime.now(timezone.utc)
+        key = {"user_id": user_id, "anime_id": aid}
+        current = await self.db.watchlist.find_one(key)
+        if current and bool(current.get("favourite")) == favourite:
+            return False
+        fields = {"favourite": favourite, "updated_at": now}
+        defaults = {
+            "user_id": user_id,
+            "anime_id": aid,
+            "status": "unknown",
+            "rating": None,
+            "priority": 0,
+            "notes": "",
+            "review": "",
+            "rewatch_count": 0,
+            "added_at": now,
+        }
+        try:
+            result = await self.db.watchlist.update_one(
+                key,
+                {"$set": fields, "$setOnInsert": defaults},
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            result = await self.db.watchlist.update_one(key, {"$set": fields})
+        if not result.modified_count and result.upserted_id is None:
+            return False
+        await self.db.activity.insert_one(
+            {"user_id": user_id, "anime_id": aid, "kind": "favourite", "value": favourite, "at": now}
+        )
+        return True
+
+    async def set_rating(self, user_id: int, anime_id: str, rating: int | None) -> bool:
+        if not ObjectId.is_valid(anime_id):
+            raise ValueError("Invalid anime id")
+        if rating is not None and (isinstance(rating, bool) or not 1 <= rating <= 10):
+            raise ValueError("Rating must be between 1 and 10")
+        aid = ObjectId(anime_id)
+        if not await self.db.anime.find_one({"_id": aid}, {"_id": 1}):
+            raise ValueError("Anime not found")
+        now = datetime.now(timezone.utc)
+        key = {"user_id": user_id, "anime_id": aid}
+        current = await self.db.watchlist.find_one(key)
+        if current and current.get("rating") == rating:
+            return False
+        fields = {"rating": rating, "updated_at": now}
+        defaults = {
+            "user_id": user_id,
+            "anime_id": aid,
+            "status": "unknown",
+            "favourite": False,
+            "priority": 0,
+            "notes": "",
+            "review": "",
+            "rewatch_count": 0,
+            "added_at": now,
+        }
+        try:
+            result = await self.db.watchlist.update_one(
+                key,
+                {"$set": fields, "$setOnInsert": defaults},
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            result = await self.db.watchlist.update_one(key, {"$set": fields})
+        if not result.modified_count and result.upserted_id is None:
+            return False
+        await self.db.activity.insert_one(
+            {"user_id": user_id, "anime_id": aid, "kind": "rating", "value": rating, "at": now}
+        )
+        return True
+
     async def list(
-        self, user_id: int, status: str | None = None, limit: int = 25
+        self, user_id: int, status: str | None = None, limit: int = 25,
+        favourite: bool | None = None,
     ) -> list[dict]:
         match: dict[str, Any] = {"user_id": user_id}
         if status:
             match["status"] = status
+        if favourite is not None:
+            match["favourite"] = favourite
         rows = (
             await self.db.watchlist.find(match)
             .sort("updated_at", -1)
