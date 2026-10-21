@@ -1,6 +1,5 @@
 import html
 import logging
-import asyncio
 import re
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
@@ -8,7 +7,7 @@ from urllib.parse import quote_plus
 from bson import ObjectId
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, RetryAfter, TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from anime_bot.config import get_settings
@@ -46,8 +45,6 @@ START_IMAGES = (
     "https://graph.org/file/dc7fcd70a16a81e6da48f-b633fcf31d25c21088.jpg",
     "https://graph.org/file/9cb5e9c3285fe51ef4b0f-7294b1a2290fdd2c38.jpg",
 )
-LOADING_FRAMES = ("▣☐☐", "☐▣☐", "☐☐▣")
-LOADING_MESSAGES = {}
 
 
 def services(context):
@@ -85,16 +82,10 @@ async def allowed(
             if not callback_answered:
                 await update.callback_query.answer("Access denied", show_alert=True)
             else:
-                try:
-                    await update.callback_query.edit_message_text(
+                if update.effective_message:
+                    await update.effective_message.reply_text(
                         "Access denied. Use /request_access to ask the owner."
                     )
-                except BadRequest as exc:
-                    log.warning("Could not edit access-denied response: %s", exc)
-                    if update.effective_message:
-                        await update.effective_message.reply_text(
-                            "Access denied. Use /request_access to ask the owner."
-                        )
         elif update.effective_message:
             await update.effective_message.reply_text(
                 "Access denied. Use /request_access to ask the owner."
@@ -118,12 +109,8 @@ async def allowed(
         )
     if owner and not is_owner:
         if update.callback_query and callback_answered:
-            try:
-                await update.callback_query.edit_message_text("Owner only.")
-            except BadRequest as exc:
-                log.warning("Could not edit owner-only response: %s", exc)
-                if update.effective_message:
-                    await update.effective_message.reply_text("Owner only.")
+            if update.effective_message:
+                await update.effective_message.reply_text("Owner only.")
         elif update.effective_message:
             await update.effective_message.reply_text("Owner only.")
         return False
@@ -147,41 +134,7 @@ def _set_current(context, screen, *, push=True, reset=False):
 
 
 async def render(update, text, markup=None):
-    """Render every callback screen in-place; commands start one new screen message."""
-    query = update.callback_query
-    if query:
-        try:
-            await query.edit_message_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-            return
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).casefold():
-                return
-            # For old messages that Telegram will not edit, fall back to one fresh screen.
-            log.warning("Could not edit callback screen: %s", exc)
-    key = _message_key(update)
-    target = LOADING_MESSAGES.pop(key, None)
-    if target:
-        try:
-            await target.edit_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-            return
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).casefold():
-                return
-            try:
-                await target.delete()
-            except TelegramError:
-                pass
-            log.debug("Could not replace loading message: %s", exc)
+    """Send each screen as a fresh message; never edit an earlier Telegram message."""
     message = update.effective_message
     if message:
         try:
@@ -201,98 +154,9 @@ async def render(update, text, markup=None):
                 log.error("Plain-text fallback failed: %s", fallback_exc)
 
 
-def _message_key(update):
-    chat = update.effective_chat
-    user = update.effective_user
-    return (chat.id if chat else 0, user.id if user else 0)
-
-
-async def _animate_loading(target, stop, label, interval=1.1):
-    frame_index = 1
-    while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
-            break
-        except asyncio.TimeoutError:
-            pass
-        text = f"{LOADING_FRAMES[frame_index]}\n{label}"
-        frame_index = (frame_index + 1) % len(LOADING_FRAMES)
-        try:
-            await target.edit_text(text)
-        except RetryAfter as exc:
-            try:
-                await asyncio.wait_for(
-                    stop.wait(), timeout=float(exc.retry_after) + 0.1
-                )
-            except asyncio.TimeoutError:
-                continue
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).casefold():
-                continue
-            return
-        except TelegramError:
-            return
-
-
-async def run_with_loading(update, context, operation, label="Loading…", threshold=0.8):
-    """Run an awaitable and animate only after it exceeds the short-operation threshold."""
-    lock = context.user_data.setdefault("_loading_lock", asyncio.Lock())
-    async with lock:
-        task = asyncio.create_task(operation())
-        target = None
-        stop = asyncio.Event()
-        animator = None
-        try:
-            try:
-                return await asyncio.wait_for(asyncio.shield(task), timeout=threshold)
-            except asyncio.TimeoutError:
-                if task.done():
-                    return task.result()
-            frame = f"{LOADING_FRAMES[0]}\n{label}"
-            query = update.callback_query
-            if query:
-                target = query.message
-                try:
-                    await query.edit_message_text(frame)
-                except BadRequest as exc:
-                    if "message is not modified" not in str(exc).casefold():
-                        log.debug("Could not show callback loading frame: %s", exc)
-            elif update.effective_message:
-                target = await update.effective_message.reply_text(frame)
-                LOADING_MESSAGES[_message_key(update)] = target
-            if target:
-                animator = asyncio.create_task(_animate_loading(target, stop, label))
-            return await task
-        except asyncio.CancelledError:
-            task.cancel()
-            if target:
-                if update.callback_query:
-                    try:
-                        await target.edit_text("Operation cancelled.")
-                    except TelegramError:
-                        pass
-                else:
-                    LOADING_MESSAGES.pop(_message_key(update), None)
-                    try:
-                        await target.delete()
-                    except TelegramError:
-                        pass
-            raise
-        finally:
-            stop.set()
-            if animator:
-                animator.cancel()
-                await asyncio.gather(animator, return_exceptions=True)
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-
-
 async def _render_current(update, context):
     try:
-        return await run_with_loading(
-            update, context, lambda: _render_screen(update, context), "Loading…"
-        )
+        return await _render_screen(update, context)
     except Exception as exc:
         log.warning("Could not render screen: %s", exc)
         return await render(
@@ -1092,21 +956,6 @@ async def start(update, context):
     )
     existing = await db.users.find_one({"user_id": user.id}) or {}
     welcome = welcome_text(user.first_name)
-    old_message_id = existing.get("start_message_id")
-    if old_message_id and existing.get("start_chat_id") == chat.id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat.id,
-                message_id=old_message_id,
-                text=welcome,
-                parse_mode=ParseMode.HTML,
-                reply_markup=home_markup(),
-                disable_web_page_preview=True,
-            )
-            return
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).casefold():
-                return
     if not existing.get("start_album_attempted"):
         album_sent = False
         try:
@@ -1129,15 +978,11 @@ async def start(update, context):
             {"user_id": user.id},
             {"$set": {"start_album_attempted": True, "start_album_sent": album_sent}},
         )
-    message = await update.effective_message.reply_text(
+    await update.effective_message.reply_text(
         welcome,
         parse_mode=ParseMode.HTML,
         reply_markup=home_markup(),
         disable_web_page_preview=True,
-    )
-    await db.users.update_one(
-        {"user_id": user.id},
-        {"$set": {"start_chat_id": chat.id, "start_message_id": message.message_id}},
     )
 
 
@@ -1563,7 +1408,7 @@ async def wtw_cmd(update, context):
             )
         return await _render_screen(update, context)
 
-    await run_with_loading(update, context, operation, "Searching provider listings…")
+    await operation()
 
 
 async def admin(update, context):
@@ -1656,19 +1501,11 @@ async def export_cmd(update, context):
         return json.dumps(payload, ensure_ascii=False, indent=2).encode()
 
     try:
-        content = await run_with_loading(
-            update, context, make_export, "Preparing your export…"
-        )
+        content = await make_export()
     except Exception as exc:
         log.warning("Export failed (%s)", type(exc).__name__)
         await render(update, "⚠️ Could not prepare your export. Please try again.")
         return
-    placeholder = LOADING_MESSAGES.pop(_message_key(update), None)
-    if placeholder:
-        try:
-            await placeholder.delete()
-        except TelegramError:
-            pass
     from io import BytesIO
 
     doc = BytesIO(content)
