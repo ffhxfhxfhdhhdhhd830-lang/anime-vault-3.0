@@ -27,6 +27,7 @@ async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     await db.anime.create_index([("aliases_norm", 1)])
     await db.watchlist.create_index([("user_id", 1), ("anime_id", 1)], unique=True)
     await db.watchlist.create_index([("user_id", 1), ("status", 1), ("priority", -1)])
+    await db.watchlist.create_index([("user_id", 1), ("favourite", 1), ("updated_at", -1)])
     await db.progress.create_index([("user_id", 1), ("anime_id", 1)], unique=True)
     await db.authorized_users.create_index("user_id", unique=True)
     await db.access_requests.create_index("user_id", unique=True)
