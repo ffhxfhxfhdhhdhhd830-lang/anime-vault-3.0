@@ -26,6 +26,8 @@ from anime_bot.services.metadata import MetadataService
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
+# HTTPX INFO logs include full Telegram API URLs, which contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("anime_bot")
 STATUS_LABELS = {
     "plan": "📝 Plan to Watch",
