@@ -985,7 +985,7 @@ def help_text():
         "<b><blockquote>❔ ʜᴇʟᴘ &amp; ᴄᴏᴍᴍᴀɴᴅs</blockquote></b>\n"
         "<b>ᴛʀᴀᴄᴋɪɴɢ</b>\n"
         "/start · /help · /about · /request_access\n"
-        "/search &lt;title&gt; · /add &lt;title&gt; [| genres]\n"
+        "/search &lt;title&gt; · /add &lt;title&gt; [| genres | format | synopsis]\n"
         "/delete &lt;title&gt; · permanently remove a manually added title\n"
         "/watchlist · /favorites · /watching · /completed · /plan · /onhold · /dropped\n"
         "/recommendations · /top · /movies · /series\n"
@@ -1138,40 +1138,61 @@ async def add(update, context):
     if not await allowed(update, context):
         return
     raw_title = " ".join(context.args).strip()
-    title, separator, raw_genres = raw_title.partition("|")
-    title = title.strip()
-    manual_genres = normalize_genres(raw_genres) if separator else []
+    parts = [part.strip() for part in raw_title.split("|", maxsplit=3)]
+    title = parts[0] if parts else ""
+    manual_genres = normalize_genres(parts[1]) if len(parts) > 1 and parts[1] else []
+    format_value = None
+    if len(parts) > 2 and parts[2]:
+        formats = {
+            "movie": "movie", "film": "movie",
+            "series": "series", "tv": "series", "tv series": "series",
+            "ova": "OVA", "ona": "ONA", "special": "special",
+            "short": "short", "franchise": "franchise", "unknown": "unknown",
+        }
+        format_value = formats.get(normalize(parts[2]))
+        if not format_value:
+            return await update.effective_message.reply_text(
+                "Format must be movie, series, OVA, ONA, special, short, or franchise."
+            )
+    synopsis = parts[3] if len(parts) > 3 and parts[3] else None
     if not title:
-        return await update.effective_message.reply_text("Use /add <title>")
+        return await update.effective_message.reply_text(
+            "Use /add <title> | <genres> | <format> | <synopsis>"
+        )
     db, anime_svc, _, _ = services(context)
     results = await anime_svc.search(title, limit=5)
     exact = next((x for x in results if x.get("title_norm") == normalize(title)), None)
     if exact:
+        updates = {}
         if manual_genres:
             merged = normalize_genres(genres_for(exact), manual_genres)
             if merged != genres_for(exact):
-                await db.anime.update_one(
-                    {"_id": exact["_id"]}, {"$set": {"genres": merged}}
-                )
+                updates["genres"] = merged
+        if format_value:
+            updates["format"] = format_value
+        if synopsis:
+            updates["synopsis"] = synopsis
+        if updates:
+            await db.anime.update_one({"_id": exact["_id"]}, {"$set": updates})
         return await show_anime(update, context, exact)
-    genres = manual_genres
+    fields = {
+        "title": title,
+        "title_norm": normalize(title),
+        "format": format_value or "unknown",
+        "genres": manual_genres,
+        "metadata_source": "user entry",
+        "created_at": datetime.now(timezone.utc),
+    }
+    if synopsis:
+        fields["synopsis"] = synopsis
     await db.anime.update_one(
         {"title_norm": normalize(title)},
-        {
-            "$setOnInsert": {
-                "title": title,
-                "title_norm": normalize(title),
-                "format": "unknown",
-                "genres": genres,
-                "metadata_source": "user entry",
-                "created_at": datetime.now(timezone.utc),
-            }
-        },
+        {"$setOnInsert": fields},
         upsert=True,
     )
     anime = await db.anime.find_one({"title_norm": normalize(title)})
-    if genres:
-        merged = normalize_genres(genres_for(anime or {}), genres)
+    if manual_genres:
+        merged = normalize_genres(genres_for(anime or {}), manual_genres)
         if merged != genres_for(anime or {}):
             await db.anime.update_one(
                 {"_id": anime["_id"]}, {"$set": {"genres": merged}}
