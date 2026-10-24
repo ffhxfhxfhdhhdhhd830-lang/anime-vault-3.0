@@ -626,6 +626,27 @@ async def _render_screen(update, context):
             f"<b><blockquote>🎭 {title}</blockquote></b>\nTap one or more genres, then choose Show selected.",
             InlineKeyboardMarkup(keyboard),
         )
+    if kind == "delete_select":
+        ids = [ObjectId(value) for value in screen.get("candidate_ids", []) if ObjectId.is_valid(value)]
+        rows = await db.anime.find({"_id": {"$in": ids}}).to_list(len(ids)) if ids else []
+        keyboard = [
+            [InlineKeyboardButton(f"{str(row.get('title', 'Untitled'))[:48]}" + (f" ({row['year']})" if row.get("year") else ""), callback_data=f"v1:delete_pick:{row['_id']}")]
+            for row in rows
+        ]
+        keyboard.extend(navigation_row())
+        return await render(update, "Select the title you want to remove:", InlineKeyboardMarkup(keyboard))
+    if kind == "delete_confirm":
+        if int(screen.get("requester_id", 0)) != uid:
+            return await render(update, "This delete confirmation belongs to another user.", home_markup())
+        anime = await db.anime.find_one({"_id": ObjectId(screen["anime_id"])})
+        if not anime:
+            return await render(update, "That title has already been removed.", home_markup())
+        title = html.escape(str(anime.get("title", "Untitled")))
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Yes, permanently delete", callback_data=f"v1:delete_confirm:{anime['_id']}")],
+            [InlineKeyboardButton("Cancel", callback_data="v1:delete_cancel")],
+        ])
+        return await render(update, f"<b>Delete {title} permanently?</b>\nThis removes the catalogue entry and your related watchlist, progress, and activity records. It cannot be undone.", keyboard)
     if kind == "top_by_genre":
         watched = await watched_titles(db, uid)
         rows = await anilist.top_unwatched_by_genre(watched) if anilist else []
@@ -965,6 +986,7 @@ def help_text():
         "<b>ᴛʀᴀᴄᴋɪɴɢ</b>\n"
         "/start · /help · /about · /request_access\n"
         "/search &lt;title&gt; · /add &lt;title&gt; [| genres]\n"
+        "/delete &lt;title&gt; · permanently remove a manually added title\n"
         "/watchlist · /favorites · /watching · /completed · /plan · /onhold · /dropped\n"
         "/recommendations · /top · /movies · /series\n"
         "/wtw &lt;title&gt; · /progress · /continue · /stats · /export\n\n"
@@ -1177,6 +1199,30 @@ async def list_cmd(update, context, status=None):
     )
 
 
+async def _other_anime_references(db, anime_id, user_id):
+    matches = []
+    for name in ("watchlist", "progress", "activity"):
+        count = await getattr(db, name).count_documents(
+            {"anime_id": anime_id, "user_id": {"$ne": user_id}}
+        )
+        if count:
+            matches.append(name)
+    return matches
+
+
+async def delete_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    query = " ".join(context.args).strip()
+    if not query:
+        return await update.effective_message.reply_text("Usage: /delete <title you added manually>")
+    db = context.application.bot_data["db"]
+    rows = await AnimeService(db).search(query, limit=20)
+    if not rows:
+        return await update.effective_message.reply_text("No matching catalogue title was found.")
+    await _open(update, context, {"kind": "delete_select", "candidate_ids": [str(row["_id"]) for row in rows]}, reset=True)
+
+
 async def favorites_cmd(update, context):
     if await allowed(update, context):
         await _open(update, context, {"kind": "titles", "mode": "favorites", "page": 0}, reset=True)
@@ -1312,6 +1358,41 @@ async def callbacks(update, context):
         if action == "all" and len(parts) == 3 and parts[2] in {"watchlist", "completed"}:
             target = parts[2]
             return await _open(update, context, {"kind": "titles", "mode": "watchlist" if target == "watchlist" else "statuslist", "status": "completed" if target == "completed" else None, "page": 0})
+        if action == "delete_pick" and len(parts) == 3 and ObjectId.is_valid(parts[2]):
+            aid = ObjectId(parts[2])
+            screen = ui["current"]
+            if screen.get("kind") != "delete_select" or parts[2] not in screen.get("candidate_ids", []):
+                raise ValueError("Delete selection expired. Run /delete again.")
+            anime = await db.anime.find_one({"_id": aid})
+            if not anime:
+                return await render(update, "That catalogue entry no longer exists.", home_markup())
+            if anime.get("metadata_source") != "user entry":
+                return await render(update, "Only titles created by your /add command can be permanently deleted. This title is part of the shared catalogue.", InlineKeyboardMarkup(navigation_row()))
+            blockers = await _other_anime_references(db, aid, update.effective_user.id)
+            if blockers:
+                return await render(update, "This title is referenced by another user's records, so it cannot be permanently deleted.", InlineKeyboardMarkup(navigation_row()))
+            return await _open(update, context, {"kind": "delete_confirm", "anime_id": parts[2], "requester_id": update.effective_user.id})
+        if action == "delete_confirm" and len(parts) == 3 and ObjectId.is_valid(parts[2]):
+            screen = ui["current"]
+            if screen.get("kind") != "delete_confirm" or screen.get("anime_id") != parts[2] or int(screen.get("requester_id", 0)) != update.effective_user.id:
+                raise ValueError("Delete confirmation expired. Run /delete again.")
+            aid = ObjectId(parts[2])
+            anime = await db.anime.find_one({"_id": aid})
+            if not anime or anime.get("metadata_source") != "user entry":
+                return await render(update, "This manually added title is no longer available to delete.", home_markup())
+            blockers = await _other_anime_references(db, aid, update.effective_user.id)
+            if blockers:
+                return await render(update, "Another user's records now reference this title, so it was not deleted.", InlineKeyboardMarkup(navigation_row()))
+            for collection in (db.watchlist, db.progress, db.activity):
+                await collection.delete_many({"anime_id": aid, "user_id": update.effective_user.id})
+            await db.anime.delete_one({"_id": aid, "metadata_source": "user entry"})
+            _set_current(context, {"kind": "home"}, reset=True)
+            return await render(update, f"Deleted <b>{html.escape(str(anime.get('title', 'Untitled')))}</b> from your catalogue.", home_markup())
+        if action == "delete_cancel":
+            if ui["current"].get("kind") != "delete_confirm":
+                raise ValueError("There is no delete confirmation to cancel.")
+            ui["current"] = ui["back"].pop() if ui["back"] else {"kind": "home"}
+            return await _render_current(update, context)
         if action == "favorites":
             return await _open(update, context, {"kind": "titles", "mode": "favorites", "page": 0})
         if action == "anime" and len(parts) == 3 and ObjectId.is_valid(parts[2]):
@@ -1721,6 +1802,7 @@ def build_app():
         "whoami": whoami,
         "search": search,
         "add": add,
+        "delete": delete_cmd,
         "watchlist": list_cmd,
         "watching": lambda u, c: list_cmd(u, c, "watching"),
         "completed": lambda u, c: list_cmd(u, c, "completed"),
