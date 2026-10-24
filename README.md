@@ -52,5 +52,7 @@ Implemented: async Telegram command bot, Mongo persistence/indexes, owner-only a
 
 Use `/delete <title>` to remove a manually added catalogue title. The bot asks for confirmation and refuses permanent deletion if another user's watchlist, progress, or activity records reference it.
 
+Add or update catalogue details with `/add <title> | <genres> | <format> | <synopsis>`. For example: `/add Frieren | Adventure, Drama, Fantasy | series | An elf mage reflects on a journey after the heroes' victory.` Supported formats are `movie`, `series`, `OVA`, `ONA`, `special`, `short`, and `franchise` (`film` and `tv` are accepted aliases). Genres, format, and synopsis are optional; keep the separators to leave an earlier field blank, such as `/add My Title | | movie | A short synopsis.` You can also keep using `/add <title>` or `/add <title> | <genres>`. If the title already exists, the supplied details update that catalogue entry.
+
 All handlers that reveal personal or catalogue data check authorization. The owner is always recognized by numeric ID; approved users are stored in `authorized_users`. MongoDB is never dropped or cleared at startup. Keep a least-privilege DB account and encrypted backups.
 
