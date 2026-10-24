@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 from bson import ObjectId
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, MessageNotModified, TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from anime_bot.config import get_settings
@@ -148,10 +148,10 @@ async def render(update, text, markup=None):
                 reply_markup=markup,
                 disable_web_page_preview=True,
             )
-        except MessageNotModified:
-            # Repeated delivery of the same button callback is harmless.
-            return query.message
         except BadRequest as exc:
+            if "message is not modified" in str(exc).casefold():
+                # Repeated delivery of the same button callback is harmless.
+                return query.message
             log.warning("Could not edit formatted screen: %s", exc)
             try:
                 return await query.edit_message_text(
@@ -160,9 +160,9 @@ async def render(update, text, markup=None):
                     reply_markup=markup,
                     disable_web_page_preview=True,
                 )
-            except MessageNotModified:
-                return query.message
             except BadRequest as fallback_exc:
+                if "message is not modified" in str(fallback_exc).casefold():
+                    return query.message
                 log.warning("Could not edit plain-text screen: %s", fallback_exc)
             except TelegramError as fallback_exc:
                 log.error("Plain-text screen edit failed: %s", fallback_exc)
