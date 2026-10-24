@@ -21,6 +21,7 @@ from anime_bot.services.core import (
 )
 from anime_bot.services.genres import genres_for, normalize_genres
 from anime_bot.services.metadata import MetadataService
+from anime_bot.services.anilist import AniListService, watched_titles, linked_title
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -286,9 +287,23 @@ async def _registered_users(db):
     return [merged[user_id] for user_id in sorted(merged)]
 
 
-async def screen_genres(db, screen, user_id, metadata=None):
+async def screen_genres(db, screen, user_id, metadata=None, anilist=None):
     mode = screen["mode"]
-    catalogue = await _catalogue(db)
+    if mode in {"watchlist", "completed"}:
+        rows = await WatchlistService(db).list(
+            user_id,
+            status="completed" if mode == "completed" else None,
+            limit=MAX_CATALOGUE,
+            exclude_status="completed" if mode == "watchlist" else None,
+        )
+        if anilist:
+            await anilist.enrich_catalogue(rows)
+        screen["count"] = len(rows)
+        catalogue = rows
+    elif mode == "series" and anilist:
+        return await anilist.genres()
+    else:
+        catalogue = await _catalogue(db)
     if mode in {"movie", "series"}:
         catalogue = [a for a in catalogue if _format_kind(a.get("format")) == mode]
     if mode == "recommend":
@@ -304,7 +319,7 @@ async def screen_genres(db, screen, user_id, metadata=None):
     return [genre_to_ids[key] for key in sorted(genre_to_ids)]
 
 
-async def _list_titles(db, user_id, screen, metadata=None):
+async def _list_titles(db, user_id, screen, metadata=None, anilist=None):
     mode = screen["mode"]
     genre = screen.get("genre")
     if mode in {"watchlist", "statuslist", "favorites"}:
@@ -313,7 +328,12 @@ async def _list_titles(db, user_id, screen, metadata=None):
             screen.get("status"),
             limit=MAX_CATALOGUE,
             favourite=True if mode == "favorites" else None,
+            exclude_status="completed" if mode == "watchlist" else None,
         )
+        if anilist:
+            await anilist.enrich_catalogue(rows)
+        if genre:
+            rows = [a for a in rows if any(g.casefold() == genre.casefold() for g in _genre_values(a))]
         if mode == "favorites":
             return rows, "Your favorites"
         return rows, "Your watchlist" if mode == "watchlist" else STATUS_LABELS.get(screen.get("status"), "Watchlist")
@@ -385,6 +405,9 @@ def _title_keyboard(rows, page, mode):
         title = str(anime.get("title", "Untitled"))
         year = anime.get("year")
         label = f"{title} ({year})" if year else title
+        genres = _genre_values(anime)
+        if genres and mode in {"watchlist", "statuslist", "favorites"}:
+            label += " · " + ", ".join(genres[:3])
         if anime.get("_display_rating") is not None:
             label += f" · ⭐ {anime['_display_rating']:g}/10"
         button = InlineKeyboardButton(
@@ -488,6 +511,7 @@ def _wtw_screen(title, offers):
 async def _render_screen(update, context):
     db = context.application.bot_data["db"]
     metadata = context.application.bot_data.get("metadata")
+    anilist = context.application.bot_data.get("anilist")
     uid = update.effective_user.id
     screen = current_ui(context)["current"]
     kind = screen["kind"]
@@ -526,12 +550,18 @@ async def _render_screen(update, context):
         text, markup = _wtw_screen(title, offers)
         return await render(update, text, markup)
     if kind == "genres":
-        genres = await screen_genres(db, screen, uid, metadata)
+        genres = await screen_genres(db, screen, uid, metadata, anilist)
         if not genres:
+            keyboard = []
+            if screen["mode"] in {"watchlist", "completed"}:
+                label = "All completed" if screen["mode"] == "completed" else "All unwatched in watchlist"
+                target = "completed" if screen["mode"] == "completed" else "watchlist"
+                keyboard.append([InlineKeyboardButton(f"{label} ({screen.get('count', 0)})", callback_data=f"v1:all:{target}")])
+            keyboard.extend(navigation_row())
             return await render(
                 update,
-                "No genres are available in the matching catalogue entries yet.",
-                InlineKeyboardMarkup(navigation_row()),
+                "No genre data is available for these titles yet." if screen["mode"] not in {"watchlist", "completed"} else "No genres are available yet. You can still open the full list below.",
+                InlineKeyboardMarkup(keyboard),
             )
         page = max(0, min(int(screen.get("page", 0)), (len(genres) - 1) // PAGE_SIZE))
         screen["page"] = page
@@ -559,20 +589,56 @@ async def _render_screen(update, context):
                     InlineKeyboardButton("Next ➡️", callback_data=f"v1:gpage:{page + 1}")
                 )
             keyboard.append(pages)
+        if screen["mode"] in {"watchlist", "completed"}:
+            label = "All completed" if screen["mode"] == "completed" else "All unwatched in watchlist"
+            target = "completed" if screen["mode"] == "completed" else "watchlist"
+            keyboard.append([InlineKeyboardButton(f"{label} ({screen.get('count', 0)})", callback_data=f"v1:all:{target}")])
         keyboard.extend(navigation_row())
         title = {
             "recommend": "Choose a genre for recommendations",
-            "top": "Choose a genre to see your highest personal ratings",
+            "top": "Top unwatched anime in each genre",
             "movie": "Choose a movie genre",
             "series": "Choose a series genre",
+            "watchlist": "Choose a genre in your watchlist",
+            "completed": "Choose a genre in your completed anime",
         }.get(screen["mode"], "Choose a genre")
         return await render(
             update,
             f"<b><blockquote>🎭 {title}</blockquote></b>",
             InlineKeyboardMarkup(keyboard),
         )
+    if kind == "top_by_genre":
+        watched = await watched_titles(db, uid)
+        rows = await anilist.top_unwatched_by_genre(watched) if anilist else []
+        if not rows:
+            return await render(update, "The online genre ranking is temporarily unavailable. Please try again shortly.", InlineKeyboardMarkup(navigation_row()))
+        page_count = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(int(screen.get("page", 0)), page_count - 1))
+        screen["page"] = page
+        lines = ["<b><blockquote>⭐ Top unwatched anime by genre</blockquote></b>"]
+        lines.extend(f"• {linked_title(row)} - {html.escape(row['_genre'])}" for row in rows[page * PAGE_SIZE : (page + 1) * PAGE_SIZE])
+        keyboard = []
+        if page_count > 1:
+            controls = []
+            if page:
+                controls.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"v1:page:{page - 1}"))
+            controls.append(InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data="v1:page:noop"))
+            if page + 1 < page_count:
+                controls.append(InlineKeyboardButton("Next ➡️", callback_data=f"v1:page:{page + 1}"))
+            keyboard.append(controls)
+        keyboard.extend(navigation_row())
+        return await render(update, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+    if kind == "external_series":
+        watched = await watched_titles(db, uid)
+        genre = str(screen.get("genre", ""))
+        rows = await anilist.series_for_genre(genre, watched) if anilist else []
+        if not rows:
+            return await render(update, f"No unwatched series are available for {html.escape(genre)} right now.", InlineKeyboardMarkup(navigation_row()))
+        lines = [f"<b><blockquote>📺 {html.escape(genre)} series</blockquote></b>"]
+        lines.extend(f"• {linked_title(row)} - {html.escape(genre)}" for row in rows)
+        return await render(update, "\n".join(lines), InlineKeyboardMarkup(navigation_row()))
     if kind == "titles":
-        rows, heading = await _list_titles(db, uid, screen, metadata)
+        rows, heading = await _list_titles(db, uid, screen, metadata, anilist)
         rows = _dedupe_titles(rows)
         if not rows:
             if screen["mode"] == "top":
@@ -1085,7 +1151,13 @@ async def add(update, context):
 async def list_cmd(update, context, status=None):
     if not await allowed(update, context):
         return
-    mode = "watchlist" if status is None else "statuslist"
+    if status == "completed":
+        await _open(update, context, {"kind": "genres", "mode": "completed"}, reset=True)
+        return
+    if status is None:
+        await _open(update, context, {"kind": "genres", "mode": "watchlist"}, reset=True)
+        return
+    mode = "statuslist"
     await _open(
         update,
         context,
@@ -1108,6 +1180,9 @@ async def recommendations(update, context):
 def genre_command(mode):
     async def handler(update, context):
         if await allowed(update, context):
+            if mode == "top":
+                await _open(update, context, {"kind": "top_by_genre"}, reset=True)
+                return
             await _open(update, context, {"kind": "genres", "mode": mode}, reset=True)
 
     return handler
@@ -1148,17 +1223,24 @@ async def callbacks(update, context):
             and len(parts) == 3
             and parts[2] in {"recommend", "top", "movie", "series"}
         ):
+            if parts[2] == "top":
+                return await _open(update, context, {"kind": "top_by_genre"})
             return await _open(update, context, {"kind": "genres", "mode": parts[2]})
         if (
             action == "genre"
             and len(parts) == 3
             and ui["current"].get("kind") == "genres"
         ):
-            genres = await screen_genres(db, ui["current"], update.effective_user.id)
+            anilist = context.application.bot_data.get("anilist")
+            genres = await screen_genres(db, ui["current"], update.effective_user.id, context.application.bot_data.get("metadata"), anilist)
             index = int(parts[2])
             if index < 0 or index >= len(genres):
                 raise ValueError("Invalid genre selection")
             mode = ui["current"]["mode"]
+            if mode == "series":
+                return await _open(update, context, {"kind": "external_series", "genre": genres[index]})
+            if mode in {"watchlist", "completed"}:
+                return await _open(update, context, {"kind": "titles", "mode": "watchlist" if mode == "watchlist" else "statuslist", "status": "completed" if mode == "completed" else None, "genre": genres[index], "page": 0})
             return await _open(
                 update,
                 context,
@@ -1178,16 +1260,21 @@ async def callbacks(update, context):
         if action in {"watchlist", "statuslist"}:
             if action == "watchlist":
                 return await _open(
-                    update, context, {"kind": "titles", "mode": "watchlist", "page": 0}
+                    update, context, {"kind": "genres", "mode": "watchlist"}
                 )
             status = parts[2]
             if status not in STATUS_LABELS:
                 raise ValueError("Invalid status")
+            if status == "completed":
+                return await _open(update, context, {"kind": "genres", "mode": "completed"})
             return await _open(
                 update,
                 context,
                 {"kind": "titles", "mode": "statuslist", "status": status, "page": 0},
             )
+        if action == "all" and len(parts) == 3 and parts[2] in {"watchlist", "completed"}:
+            target = parts[2]
+            return await _open(update, context, {"kind": "titles", "mode": "watchlist" if target == "watchlist" else "statuslist", "status": "completed" if target == "completed" else None, "page": 0})
         if action == "favorites":
             return await _open(update, context, {"kind": "titles", "mode": "favorites", "page": 0})
         if action == "anime" and len(parts) == 3 and ObjectId.is_valid(parts[2]):
@@ -1269,7 +1356,7 @@ async def callbacks(update, context):
         if (
             action == "page"
             and len(parts) == 3
-            and ui["current"].get("kind") == "titles"
+            and ui["current"].get("kind") in {"titles", "top_by_genre"}
         ):
             if parts[2] == "noop":
                 return
@@ -1530,6 +1617,7 @@ async def post_init(app):
     app.bot_data["metadata"] = MetadataService(
         mongo.db, settings.tmdb_api_key.get_secret_value()
     )
+    app.bot_data["anilist"] = AniListService(mongo.db)
     await mongo.db.authorized_users.update_one(
         {"user_id": settings.owner_telegram_id},
         {
@@ -1547,6 +1635,8 @@ async def post_init(app):
 async def post_shutdown(app):
     if app.bot_data.get("metadata"):
         await app.bot_data["metadata"].close()
+    if app.bot_data.get("anilist"):
+        await app.bot_data["anilist"].close()
     if app.bot_data.get("mongo"):
         await app.bot_data["mongo"].close()
 
