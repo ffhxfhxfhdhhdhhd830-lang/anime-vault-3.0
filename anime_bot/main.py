@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 from bson import ObjectId
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, MessageNotModified, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from anime_bot.config import get_settings
@@ -135,11 +135,60 @@ def _set_current(context, screen, *, push=True, reset=False):
 
 
 async def render(update, text, markup=None):
-    """Send each screen as a fresh message; never edit an earlier Telegram message."""
+    """Render a screen by editing its callback message, or replying to a command."""
+    query = update.callback_query
     message = update.effective_message
+    plain_text = html.unescape(re.sub(r"<[^>]*>", "", text))
+
+    if query:
+        try:
+            return await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except MessageNotModified:
+            # Repeated delivery of the same button callback is harmless.
+            return query.message
+        except BadRequest as exc:
+            log.warning("Could not edit formatted screen: %s", exc)
+            try:
+                return await query.edit_message_text(
+                    plain_text,
+                    parse_mode=None,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except MessageNotModified:
+                return query.message
+            except BadRequest as fallback_exc:
+                log.warning("Could not edit plain-text screen: %s", fallback_exc)
+            except TelegramError as fallback_exc:
+                log.error("Plain-text screen edit failed: %s", fallback_exc)
+
+            # Some Telegram messages (for example, media captions) cannot be
+            # converted into text messages. Keep the interaction usable by
+            # replying with a new screen when editing is not supported.
+            try:
+                return await query.message.reply_text(
+                    plain_text,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except TelegramError as fallback_exc:
+                log.error("Could not send fallback screen: %s", fallback_exc)
+                try:
+                    return await query.message.reply_text(
+                        plain_text, disable_web_page_preview=True
+                    )
+                except TelegramError as final_exc:
+                    log.error("Unformatted fallback screen failed: %s", final_exc)
+            return None
+
     if message:
         try:
-            await message.reply_text(
+            return await message.reply_text(
                 text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=markup,
@@ -147,12 +196,17 @@ async def render(update, text, markup=None):
             )
         except BadRequest as exc:
             log.warning("Could not send formatted screen: %s", exc)
-            plain_text = html.unescape(re.sub(r"<[^>]*>", "", text))
-            # Preserve a visible response even if Telegram rejects rich text/markup.
             try:
-                await message.reply_text(plain_text, disable_web_page_preview=True)
+                return await message.reply_text(
+                    plain_text,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
             except TelegramError as fallback_exc:
                 log.error("Plain-text fallback failed: %s", fallback_exc)
+        except TelegramError as exc:
+            log.error("Could not send screen: %s", exc)
+    return None
 
 
 async def _render_current(update, context):
