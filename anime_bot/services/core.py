@@ -197,13 +197,15 @@ class WatchlistService:
 
     async def list(
         self, user_id: int, status: str | None = None, limit: int = 25,
-        favourite: bool | None = None,
+        favourite: bool | None = None, exclude_status: str | None = None,
     ) -> list[dict]:
         match: dict[str, Any] = {"user_id": user_id}
         if status:
             match["status"] = status
         if favourite is not None:
             match["favourite"] = favourite
+        if exclude_status:
+            match["status"] = {"$ne": exclude_status}
         rows = (
             await self.db.watchlist.find(match)
             .sort("updated_at", -1)
