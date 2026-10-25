@@ -9,7 +9,7 @@ from bson import ObjectId
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from anime_bot.config import get_settings
 from anime_bot.database.mongo import Mongo
@@ -23,6 +23,17 @@ from anime_bot.services.core import (
 from anime_bot.services.genres import CANONICAL_GENRES, genres_for, normalize_genres
 from anime_bot.services.metadata import MetadataService
 from anime_bot.services.anilist import AniListService, watched_titles
+from anime_bot.extra_commands import (
+    cancel_utility_cmd,
+    font_back_callback,
+    font_cmd,
+    font_style_callback,
+    logs_cmd,
+    pending_media_handler,
+    restart_cmd,
+    stickerid_cmd,
+    telegraph_cmd,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -1132,6 +1143,8 @@ def help_text():
         "/wtw &lt;title&gt; · /progress · /continue · /stats · /export\n\n"
         "<b>ᴏᴡɴᴇʀ ᴏɴʟʏ</b>\n"
         "/users · /pending_users · /info [id] · /id\n"
+        "/telegraph · /stickerid · /font &lt;text&gt;\n"
+        "/logs · /restart (owner only) · /cancel\n"
         "/totalrequests · /purgerequests CONFIRM · /allow &lt;id&gt; · /deny &lt;id&gt;\n"
         "/approve &lt;id&gt; · /reject &lt;id&gt; · /block &lt;id&gt; · /unblock &lt;id&gt; · /health"
     )
@@ -2078,6 +2091,12 @@ def build_app():
         "import": import_cmd,
         "cancel": _cancel_cmd,
         "request_access": request_access,
+        "telegraph": telegraph_cmd,
+        "stickerid": stickerid_cmd,
+        "font": font_cmd,
+        "logs": logs_cmd,
+        "restart": restart_cmd,
+        "cancel": cancel_utility_cmd,
     }
     for name, fn in commands.items():
         app.add_handler(CommandHandler(name, fn))
@@ -2091,6 +2110,16 @@ def build_app():
         "health",
     ):
         app.add_handler(CommandHandler(name, admin))
+    # Utility callback handlers must be registered before the general anime UI handler.
+    app.add_handler(CallbackQueryHandler(font_style_callback, pattern=r"^font:(?!back$)[a-z_]+$"))
+    app.add_handler(CallbackQueryHandler(font_back_callback, pattern=r"^font:back$"))
+    app.add_handler(
+        MessageHandler(
+            (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.Sticker.ALL |
+             (filters.TEXT & ~filters.COMMAND)),
+            pending_media_handler,
+        )
+    )
     app.add_handler(CallbackQueryHandler(callbacks))
     return app
 
