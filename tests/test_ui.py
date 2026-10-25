@@ -243,7 +243,7 @@ async def test_genre_to_titles_to_details_and_back_uses_same_message():
         "current": {"kind": "genres", "mode": "movie"},
         "back": [],
     }
-    for payload in ("v1:genre:0", "v1:show", f"v1:anime:{aid}", "v1:back"):
+    for payload in ("v1:genre:5", "v1:show", f"v1:anime:{aid}", "v1:back"):
         edit = AsyncMock()
         query = SimpleNamespace(
             data=payload,
