@@ -140,8 +140,8 @@ async def test_loading_animation_cycles_exact_frames_and_stops_cleanly():
     target.edit_text = AsyncMock(side_effect=edit)
     await _animate_loading(target, stop, "Working", interval=0.001)
     rendered = [text.splitlines()[0] for text in frames]
-    assert LOADING_FRAMES == ("???", "???", "???")
-    assert rendered == ["???", "???", "???"]
+    assert LOADING_FRAMES == ("▣☐☐", "☐▣☐", "☐☐▣")
+    assert rendered == ["▣☐☐", "☐▣☐", "☐☐▣"]
 
 
 def test_welcome_escapes_user_html():
