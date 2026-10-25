@@ -219,7 +219,7 @@ async def render(update, text, markup=None):
     images = PICS
 
     if query:
-        if query.message and query.message.photo:
+        if query.message and getattr(query.message, "photo", None):
             if caption_fits:
                 try:
                     return await query.edit_message_media(
