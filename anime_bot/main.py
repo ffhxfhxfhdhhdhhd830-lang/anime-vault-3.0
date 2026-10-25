@@ -2063,9 +2063,12 @@ async def _reminders_cmd(update, context):
 
 async def _cancel_cmd(update, context):
     if await allowed(update, context):
-        pending = context.user_data.pop("awaiting_sticker", None) or context.user_data.pop("awaiting_telegraph", None)
+        sticker_pending = context.user_data.pop("awaiting_sticker", None)
+        telegraph_pending = context.user_data.pop("awaiting_telegraph", None)
         await update.message.reply_text(
-            "Cancelled the pending utility action." if pending else "No active workflow."
+            "Cancelled the pending utility action."
+            if sticker_pending or telegraph_pending
+            else "No active workflow."
         )
 
 
