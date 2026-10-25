@@ -258,7 +258,7 @@ async def test_genre_to_titles_to_details_and_back_uses_same_message():
     assert context.user_data["anime_ui"]["current"] == {
         "kind": "titles",
         "mode": "movie",
-        "genre": "Romance",
+        "genres": ["Romance"],
         "page": 0,
     }
 
