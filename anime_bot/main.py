@@ -159,7 +159,15 @@ async def allowed(
             if not callback_answered:
                 await update.callback_query.answer("Access denied", show_alert=True)
             else:
-                if update.effective_message:
+                if update.callback_query:
+                    try:
+                        await update.callback_query.edit_message_text(
+                            "Access denied. Use /request_access to ask the owner.",
+                            reply_markup=None,
+                        )
+                    except TelegramError as exc:
+                        log.warning("Could not update denied callback message: %s", type(exc).__name__)
+                elif update.effective_message:
                     await update.effective_message.reply_text(
                         "Access denied. Use /request_access to ask the owner."
                     )
