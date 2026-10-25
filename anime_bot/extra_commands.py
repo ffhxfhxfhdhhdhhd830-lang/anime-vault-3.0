@@ -158,11 +158,13 @@ async def font_style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     if not query:
         return
+    if not await _has_access(update, context):
+        return
     await query.answer()
     style = (query.data or "").partition(":")[2]
     original = context.user_data.get("font_original")
     if style not in FONT_STYLES or not original:
-        await query.answer("Please run /font again.", show_alert=True)
+        await query.edit_message_text("Please run /font <text> again.")
         return
     converted = _font_text(original, style)
     await query.edit_message_text(
@@ -176,6 +178,8 @@ async def font_style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def font_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
+        return
+    if not await _has_access(update, context):
         return
     await query.answer()
     original = context.user_data.get("font_original")
