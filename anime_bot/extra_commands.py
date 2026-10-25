@@ -93,7 +93,7 @@ def _font_text(value: str, style: str) -> str:
         small = str.maketrans({
             **dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ")),
         })
-        return value.translate(small)
+        return value.lower().translate(small)
     upper, lower = starts.get(style, starts["bold"])
     result = []
     for char in value:
