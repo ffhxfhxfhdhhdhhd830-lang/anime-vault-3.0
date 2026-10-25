@@ -25,7 +25,6 @@ from anime_bot.services.genres import CANONICAL_GENRES, genres_for, normalize_ge
 from anime_bot.services.metadata import MetadataService
 from anime_bot.services.anilist import AniListService, watched_titles
 from anime_bot.extra_commands import (
-    cancel_utility_cmd,
     font_back_callback,
     font_cmd,
     font_style_callback,
@@ -2064,7 +2063,10 @@ async def _reminders_cmd(update, context):
 
 async def _cancel_cmd(update, context):
     if await allowed(update, context):
-        await update.message.reply_text("No active workflow.")
+        pending = context.user_data.pop("awaiting_sticker", None) or context.user_data.pop("awaiting_telegraph", None)
+        await update.message.reply_text(
+            "Cancelled the pending utility action." if pending else "No active workflow."
+        )
 
 
 def build_app():
@@ -2124,7 +2126,6 @@ def build_app():
         "font": font_cmd,
         "logs": logs_cmd,
         "restart": restart_cmd,
-        "cancel": cancel_utility_cmd,
     }
     for name, fn in commands.items():
         app.add_handler(CommandHandler(name, fn))
