@@ -6,7 +6,7 @@ A private, MongoDB-backed Telegram tracker. The project works without external m
 
 1. Install Python 3.12 from python.org and MongoDB locally or use MongoDB Atlas. In Atlas, create a database user with read/write access only to the chosen database, enable TLS, and allow your machine's IP.
 2. Create a bot with `@BotFather`. Send `/whoami` to this bot after it starts to get your numeric Telegram ID (or obtain it from a trusted ID bot). Do not publish it.
-3. Copy `.env.example` to `.env`, then set the token, owner ID and MongoDB URI. Keep `.env` private; it is excluded from Git.
+3. Copy `.env.example` to `.env`, then set the token, owner ID and MongoDB URI. Optionally set `LOG_CHANNEL` to a Telegram channel ID where the bot can post, and `PICS` to a space-separated list of image URLs or Telegram file IDs. Keep `.env` private; it is excluded from Git.
 4. From PowerShell in this directory:
 
 ```powershell
@@ -35,7 +35,7 @@ Run checks with `python -m pytest` and `ruff check .`. Stop locally with Ctrl+C;
 
 `TMDB_API_KEY` optionally enables TMDb genre enrichment and region-specific provider listings for `/wtw`. A title is matched by name and format with a confidence threshold; uncertain matches are left unresolved. Provider search links are clearly labeled and do not verify availability. TMDb provider listings and its returned link are the source of verified offers. `STREAMING_API_KEY` remains reserved because no authorized provider API adapter is configured. IMDb ratings are not inferred from TMDb.
 
-Set `DEFAULT_REGION=IN` (or another TMDb region code) and optionally configure `DEPLOYMENT_PROVIDER` for the About screen. The default About value is "Not configured."
+Set `DEFAULT_REGION=IN` (or another TMDb region code) and optionally configure `DEPLOYMENT_PROVIDER` for the About screen. The default About value is "Not configured." `PICS` accepts multiple image URLs or Telegram file IDs separated by spaces; the bot chooses one for the menu and rotates it on button navigation. Without `PICS`, the built-in image list is used. `LOG_CHANNEL` is optional and should contain a numeric Telegram chat ID; add the bot as an administrator with permission to post there.
 
 Genre normalization supports legacy fields such as `genre`, `Genres`, and `genre_names`. Run a safe, repeatable backfill after deployment:
 
@@ -48,7 +48,7 @@ The backfill only adds/normalizes the anime document's `genres` field; it does n
 
 ## Current scope and limitations
 
-Implemented: async Telegram command bot, Mongo persistence/indexes, owner-only authorization administration, persisted access requests, private-chat default, catalogue search and manual additions, status-aware watchlist updates, personal favorites, 1–10 ratings, multi-select genre filters, AniList-backed discovery with paginated anime buttons, top unwatched anime by genre, genre-filtered watchlist/completed views, optional cached TMDb provider enrichment, `/wtw`, `/users`, `/pending_users`, Help and About screens, start images with a separate menu message, personal JSON export, statistics, confirmed-title seeding, and Excel dry-run/import command. Genre menus include the requested anime categories and AniList catalogue genres. AniList genre enrichment fills missing catalogue genres when a title can be matched. Persistent reminder scheduling, custom collections, and review text entry are not implemented yet. Commands requiring these features respond honestly rather than fabricating results.
+Implemented: async Telegram command bot, Mongo persistence/indexes, owner-only authorization administration, persisted access requests, private-chat default, catalogue search and manual additions, status-aware watchlist updates, personal favorites, 1–10 ratings, multi-select genre filters, AniList-backed discovery with paginated anime buttons, top unwatched anime by genre, genre-filtered watchlist/completed views, optional cached TMDb provider enrichment, `/wtw`, `/users`, `/pending_users`, Help and About screens, rotating PICS-backed photo/caption menus, optional LOG_CHANNEL notices for new users, groups, and access requests, personal JSON export, statistics, confirmed-title seeding, and Excel dry-run/import command. Genre menus include the requested anime categories and AniList catalogue genres. AniList genre enrichment fills missing catalogue genres when a title can be matched. Persistent reminder scheduling, custom collections, and review text entry are not implemented yet. Commands requiring these features respond honestly rather than fabricating results.
 
 Use `/delete <title>` to remove a manually added catalogue title. The bot asks for confirmation and refuses permanent deletion if another user's watchlist, progress, or activity records reference it.
 
