@@ -1,5 +1,6 @@
 import html
 import logging
+import random
 import re
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
@@ -46,11 +47,55 @@ START_IMAGES = (
     "https://graph.org/file/dc7fcd70a16a81e6da48f-b633fcf31d25c21088.jpg",
     "https://graph.org/file/9cb5e9c3285fe51ef4b0f-7294b1a2290fdd2c38.jpg",
 )
+PICS = START_IMAGES
 
 
 def services(context):
     db = context.application.bot_data["db"]
     return db, AnimeService(db), WatchlistService(db), RecommendationService(db)
+
+
+async def _log_channel_event(context, text):
+    channel_id = context.application.bot_data["settings"].log_channel_id
+    if channel_id is None:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=channel_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        # A logging destination must never prevent the user's request from working.
+        log.warning("Could not post an event to LOG_CHANNEL (%s)", type(exc).__name__)
+
+
+async def _reply_text_screen(query, text, plain_text, markup):
+    if query.message.photo:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+    try:
+        return await query.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        try:
+            return await query.message.reply_text(
+                plain_text,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except TelegramError as exc:
+            log.error("Could not send text screen: %s", exc)
+    except TelegramError as exc:
+        log.error("Could not send text screen: %s", exc)
+    return None
 
 
 async def allowed(
@@ -135,12 +180,47 @@ def _set_current(context, screen, *, push=True, reset=False):
 
 
 async def render(update, text, markup=None):
-    """Render a screen by editing its callback message, or replying to a command."""
+    """Render photo-backed screens with rotating PICS and fall back to text safely."""
     query = update.callback_query
     message = update.effective_message
     plain_text = html.unescape(re.sub(r"<[^>]*>", "", text))
+    caption_fits = len(plain_text.encode("utf-16-le")) // 2 <= 950
+    images = PICS
 
     if query:
+        if query.message and query.message.photo:
+            if caption_fits:
+                try:
+                    return await query.edit_message_media(
+                        InputMediaPhoto(
+                            media=random.choice(images),
+                            caption=text,
+                            parse_mode=ParseMode.HTML,
+                        ),
+                        reply_markup=markup,
+                    )
+                except BadRequest as exc:
+                    if "message is not modified" in str(exc).casefold():
+                        return query.message
+                    log.warning("Could not rotate the screen photo: %s", exc)
+                    # Retain the current photo if only the replacement image or
+                    # formatted caption was rejected by Telegram.
+                    try:
+                        return await query.edit_message_caption(
+                            caption=plain_text,
+                            parse_mode=None,
+                            reply_markup=markup,
+                        )
+                    except BadRequest as caption_exc:
+                        if "message is not modified" in str(caption_exc).casefold():
+                            return query.message
+                        log.warning("Could not update photo caption: %s", caption_exc)
+                    except TelegramError as caption_exc:
+                        log.error("Photo caption update failed: %s", caption_exc)
+            # Captions are limited by Telegram. Longer screens become text
+            # messages, and the stale photo buttons are removed.
+            return await _reply_text_screen(query, text, plain_text, markup)
+
         try:
             return await query.edit_message_text(
                 text,
@@ -150,7 +230,6 @@ async def render(update, text, markup=None):
             )
         except BadRequest as exc:
             if "message is not modified" in str(exc).casefold():
-                # Repeated delivery of the same button callback is harmless.
                 return query.message
             log.warning("Could not edit formatted screen: %s", exc)
             try:
@@ -167,9 +246,6 @@ async def render(update, text, markup=None):
             except TelegramError as fallback_exc:
                 log.error("Plain-text screen edit failed: %s", fallback_exc)
 
-            # Some Telegram messages (for example, media captions) cannot be
-            # converted into text messages. Keep the interaction usable by
-            # replying with a new screen when editing is not supported.
             try:
                 return await query.message.reply_text(
                     plain_text,
@@ -187,6 +263,16 @@ async def render(update, text, markup=None):
             return None
 
     if message:
+        if caption_fits:
+            try:
+                return await message.reply_photo(
+                    photo=random.choice(images),
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                )
+            except BadRequest as exc:
+                log.warning("Could not send photo-backed screen: %s", exc)
         try:
             return await message.reply_text(
                 text,
@@ -1093,7 +1179,7 @@ async def start(update, context):
         )
     db = context.application.bot_data["db"]
     now = datetime.now(timezone.utc)
-    await db.users.update_one(
+    user_write = await db.users.update_one(
         {"user_id": user.id},
         {
             "$set": {
@@ -1107,36 +1193,34 @@ async def start(update, context):
         },
         upsert=True,
     )
-    existing = await db.users.find_one({"user_id": user.id}) or {}
-    welcome = welcome_text(user.first_name)
-    if not existing.get("start_album_attempted"):
-        album_sent = False
-        try:
-            await context.bot.send_media_group(
-                chat_id=chat.id,
-                media=[InputMediaPhoto(media=url) for url in START_IMAGES],
-            )
-            album_sent = True
-        except TelegramError as exc:
-            log.warning("Start image album was unavailable (%s)", type(exc).__name__)
-            # Telegram may reject an album if one URL is unavailable; try each URL
-            # independently so one working image can still be displayed.
-            for url in START_IMAGES:
-                try:
-                    await context.bot.send_photo(chat_id=chat.id, photo=url)
-                    album_sent = True
-                except TelegramError:
-                    continue
-        await db.users.update_one(
-            {"user_id": user.id},
-            {"$set": {"start_album_attempted": True, "start_album_sent": album_sent}},
+    if user_write.upserted_id is not None:
+        name = html.escape(user.full_name or "Unknown user")
+        username = f"@{html.escape(user.username)}" if user.username else "not set"
+        await _log_channel_event(
+            context,
+            "🆕 <b>New Anime Vault user</b>\n"
+            f"Name: {name}\nUsername: {username}\n"
+            f"Telegram ID: <code>{user.id}</code>",
         )
-    await update.effective_message.reply_text(
-        welcome,
-        parse_mode=ParseMode.HTML,
-        reply_markup=home_markup(),
-        disable_web_page_preview=True,
-    )
+    if chat.type != "private":
+        chat_write = await db.chats.update_one(
+            {"chat_id": chat.id},
+            {
+                "$set": {"chat_id": chat.id, "title": chat.title, "last_seen_at": now},
+                "$setOnInsert": {"registered_at": now},
+            },
+            upsert=True,
+        )
+        if chat_write.upserted_id is not None:
+            await _log_channel_event(
+                context,
+                "👥 <b>Anime Vault added to a group</b>\n"
+                f"Name: {html.escape(chat.title or 'Untitled group')}\n"
+                f"Chat ID: <code>{chat.id}</code>",
+            )
+    welcome = welcome_text(user.first_name)
+    _set_current(context, {"kind": "home"}, reset=True)
+    await render(update, welcome, home_markup())
 
 
 async def whoami(update, context):
@@ -1605,7 +1689,7 @@ async def callbacks(update, context):
 async def request_access(update, context):
     db = context.application.bot_data["db"]
     user = update.effective_user
-    await db.access_requests.update_one(
+    request_write = await db.access_requests.update_one(
         {"user_id": user.id},
         {
             "$set": {
@@ -1622,6 +1706,13 @@ async def request_access(update, context):
         },
         upsert=True,
     )
+    if request_write.upserted_id is not None:
+        await _log_channel_event(
+            context,
+            "📨 <b>New Anime Vault access request</b>\n"
+            f"Name: {html.escape(user.full_name or 'Unknown user')}\n"
+            f"Telegram ID: <code>{user.id}</code>",
+        )
     await update.message.reply_text("Access request recorded. The owner can review it.")
 
 
@@ -1861,6 +1952,8 @@ async def _cancel_cmd(update, context):
 def build_app():
     settings = get_settings()
     settings.validate_runtime()
+    global PICS
+    PICS = settings.pic_sources or START_IMAGES
     app = (
         Application.builder()
         .token(settings.telegram_bot_token.get_secret_value())
