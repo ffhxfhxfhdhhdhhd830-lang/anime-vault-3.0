@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     streaming_api_key: SecretStr = Field(
         default=SecretStr(""), alias="STREAMING_API_KEY"
     )
+    log_channel: str = Field(default="", alias="LOG_CHANNEL")
+    pics: str = Field(default="", alias="PICS")
     cache_ttl_seconds: int = Field(default=21600, alias="CACHE_TTL_SECONDS", ge=60)
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     allow_groups: bool = Field(default=False, alias="ALLOW_GROUPS")
@@ -35,6 +37,15 @@ class Settings(BaseSettings):
     def region_uppercase(cls, value: str) -> str:
         return value.upper()
 
+    @property
+    def log_channel_id(self) -> int | None:
+        value = self.log_channel.strip()
+        return int(value) if value else None
+
+    @property
+    def pic_sources(self) -> tuple[str, ...]:
+        return tuple(source for source in self.pics.split() if source)
+
     def validate_runtime(self) -> None:
         if not self.telegram_bot_token.get_secret_value().strip():
             raise ValueError(
@@ -42,6 +53,11 @@ class Settings(BaseSettings):
             )
         if self.owner_telegram_id <= 0:
             raise ValueError("OWNER_TELEGRAM_ID must be your numeric Telegram user ID.")
+        if self.log_channel.strip():
+            try:
+                int(self.log_channel.strip())
+            except ValueError as exc:
+                raise ValueError("LOG_CHANNEL must be a numeric Telegram chat ID.") from exc
 
 
 @lru_cache
