@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import random
@@ -41,6 +42,25 @@ logging.basicConfig(
 # HTTPX INFO logs include full Telegram API URLs, which contain the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("anime_bot")
+LOADING_FRAMES = ("▣☐☐", "☐▣☐", "☐☐▣")
+
+
+async def _animate_loading(message, stop_event, label="Loading", interval=0.5):
+    """Cycle through the three loading frames until stop_event is set."""
+    index = 0
+    while not stop_event.is_set():
+        try:
+            await message.edit_text(f"{LOADING_FRAMES[index]}\n{label}")
+        except BadRequest:
+            # Telegram can reject an identical edit; keep the animation alive.
+            pass
+        index = (index + 1) % len(LOADING_FRAMES)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 STATUS_LABELS = {
     "plan": "📝 Plan to Watch",
     "watching": "▶️ Watching",
