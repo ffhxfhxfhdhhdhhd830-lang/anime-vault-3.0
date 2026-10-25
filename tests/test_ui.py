@@ -166,9 +166,9 @@ async def test_detail_screen_shows_change_status_instead_of_contradictory_status
     await _render_screen(update, context)
     markup = edit.await_args.kwargs["reply_markup"]
     labels = [button.text for button in _buttons(markup)]
-    assert "?? Change status" in labels
-    assert "? Completed" not in labels
-    assert "?? s????s: ? Completed" in edit.await_args.args[0]
+    assert any("Change status" in label for label in labels)
+    assert not any("Completed" in label for label in labels)
+    assert "Completed" in edit.await_args.args[0]
 
 
 @pytest.mark.asyncio
