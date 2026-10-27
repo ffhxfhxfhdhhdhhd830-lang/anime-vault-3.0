@@ -24,6 +24,7 @@ class Mongo:
 async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     await db.users.create_index("user_id", unique=True)
     await db.chats.create_index("chat_id", unique=True)
+    await db.connections.create_index([("user_id", 1), ("chat_id", 1)], unique=True)
     await db.anime.create_index([("title_norm", 1), ("year", 1)])
     await db.anime.create_index([("aliases_norm", 1)])
     await db.watchlist.create_index([("user_id", 1), ("anime_id", 1)], unique=True)

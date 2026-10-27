@@ -4,13 +4,14 @@ import logging
 import random
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from urllib.parse import quote_plus
 
 from bson import ObjectId
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from anime_bot.config import get_settings
 from anime_bot.database.mongo import Mongo
@@ -29,10 +30,25 @@ from anime_bot.extra_commands import (
     font_cmd,
     font_style_callback,
     logs_cmd,
+    logtest_cmd,
     pending_media_handler,
     restart_cmd,
     stickerid_cmd,
     telegraph_cmd,
+    repo_cmd,
+    imdb_cmd,
+    chats_cmd,
+    channel_cmd,
+    all_users_cmd,
+    connections_cmd,
+    connect_cmd,
+    disconnect_cmd,
+    leave_cmd,
+    disable_cmd,
+    enable_cmd,
+    broadcast_cmd,
+    grp_broadcast_cmd,
+    chat_membership_update,
 )
 
 logging.basicConfig(
@@ -88,7 +104,7 @@ def services(context):
 async def _log_channel_event(context, text):
     channel_id = context.application.bot_data["settings"].log_channel_id
     if channel_id is None:
-        return
+        return False
     try:
         await context.bot.send_message(
             chat_id=channel_id,
@@ -96,9 +112,11 @@ async def _log_channel_event(context, text):
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        return True
     except TelegramError as exc:
         # A logging destination must never prevent the user's request from working.
-        log.warning("Could not post an event to LOG_CHANNEL (%s)", type(exc).__name__)
+        log.warning("Could not post an event to LOG_CHANNEL (%s): %s", type(exc).__name__, exc)
+        return False
 
 
 async def _reply_text_screen(query, text, plain_text, markup):
@@ -175,6 +193,13 @@ async def allowed(
                 "Access denied. Use /request_access to ask the owner."
             )
         return False
+    chat = update.effective_chat
+    if chat and chat.type != "private":
+        disabled = await db.chats.find_one({"chat_id": chat.id, "disabled": True})
+        if disabled:
+            if update.effective_message:
+                await update.effective_message.reply_text("Anime Vault commands are disabled in this group.")
+            return False
     if hasattr(db, "users"):
         now = datetime.now(timezone.utc)
         await db.users.update_one(
@@ -1168,10 +1193,12 @@ def help_text():
         "/watchlist · /favorites · /watching · /completed · /plan · /onhold · /dropped\n"
         "/recommendations · /top · /movies · /series\n"
         "/wtw &lt;title&gt; · /progress · /continue · /stats · /export\n"
-        "/telegraph · /stickerid · /font &lt;text&gt; · /cancel\n\n"
+        "/telegraph · /stickerid · /font &lt;text&gt; · /repo &lt;query&gt; · /imdb &lt;title&gt; · /cancel\n\n"
         "<b>ᴏᴡɴᴇʀ ᴏɴʟʏ</b>\n"
         "/users · /pending_users · /info [id] · /id\n"
-        "/logs · /restart\n"
+        "/chats · /channel · /logs · /restart · /logtest\n"
+        "/connections · /connect [group_id] · /disconnect [group_id] · /leave\n"
+        "/disable · /enable · /broadcast CONFIRM · /grp_broadcast CONFIRM\n"
         "/totalrequests · /purgerequests CONFIRM · /allow &lt;id&gt; · /deny &lt;id&gt;\n"
         "/approve &lt;id&gt; · /reject &lt;id&gt; · /block &lt;id&gt; · /unblock &lt;id&gt; · /health"
     )
@@ -1220,7 +1247,7 @@ async def start(update, context):
         )
     db = context.application.bot_data["db"]
     now = datetime.now(timezone.utc)
-    user_write = await db.users.update_one(
+    await db.users.update_one(
         {"user_id": user.id},
         {
             "$set": {
@@ -1234,20 +1261,27 @@ async def start(update, context):
         },
         upsert=True,
     )
-    if user_write.upserted_id is not None:
+    unlogged_user = await db.users.find_one(
+        {"user_id": user.id, "log_notified": {"$ne": True}}
+    )
+    if unlogged_user:
         name = html.escape(user.full_name or "Unknown user")
         username = f"@{html.escape(user.username)}" if user.username else "not set"
-        await _log_channel_event(
+        delivered = await _log_channel_event(
             context,
             "🆕 <b>New Anime Vault user</b>\n"
             f"Name: {name}\nUsername: {username}\n"
             f"Telegram ID: <code>{user.id}</code>",
         )
+        if delivered:
+            await db.users.update_one(
+                {"user_id": user.id}, {"$set": {"log_notified": True}}
+            )
     if chat.type != "private":
         chat_write = await db.chats.update_one(
             {"chat_id": chat.id},
             {
-                "$set": {"chat_id": chat.id, "title": chat.title, "last_seen_at": now},
+                "$set": {"chat_id": chat.id, "title": chat.title, "chat_type": chat.type, "last_seen_at": now},
                 "$setOnInsert": {"registered_at": now},
             },
             upsert=True,
@@ -2031,6 +2065,32 @@ async def post_init(app):
         upsert=True,
     )
     await seed_confirmed_titles(mongo.db, settings.owner_telegram_id)
+    await _log_channel_event(
+        SimpleNamespace(application=app, bot=app.bot),
+        f"✅ <b>Anime Vault started</b>\nBot ID: <code>{app.bot.id}</code>",
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    if error is not None:
+        log.error(
+            "Unhandled update error",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    if error is None:
+        return
+    safe_error = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b", "[REDACTED_BOT_TOKEN]", str(error))[:700]
+    user = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
+    who = f"User <code>{user.id}</code>" if user else "Unknown user"
+    where = f" · chat <code>{chat.id}</code>" if chat else ""
+    await _log_channel_event(
+        context,
+        "⚠️ <b>Anime Vault error</b>\n"
+        f"{who}{where}\n"
+        f"{html.escape(type(error).__name__)}: <code>{html.escape(safe_error)}</code>",
+    )
 
 
 async def post_shutdown(app):
@@ -2107,7 +2167,7 @@ def build_app():
         "recommend": recommendations,
         "recommendations": recommendations,
         "wtw": wtw_cmd,
-        "users": users_cmd,
+        "users": all_users_cmd,
         "pending_users": pending_users_cmd,
         "stats": stats,
         "movies": genre_command("movie"),
@@ -2127,8 +2187,21 @@ def build_app():
         "telegraph": telegraph_cmd,
         "stickerid": stickerid_cmd,
         "font": font_cmd,
+        "repo": repo_cmd,
+        "imdb": imdb_cmd,
         "logs": logs_cmd,
         "restart": restart_cmd,
+        "logtest": logtest_cmd,
+        "chats": chats_cmd,
+        "channel": channel_cmd,
+        "connections": connections_cmd,
+        "connect": connect_cmd,
+        "disconnect": disconnect_cmd,
+        "leave": leave_cmd,
+        "disable": disable_cmd,
+        "enable": enable_cmd,
+        "broadcast": broadcast_cmd,
+        "grp_broadcast": grp_broadcast_cmd,
     }
     for name, fn in commands.items():
         app.add_handler(CommandHandler(name, fn))
@@ -2145,6 +2218,7 @@ def build_app():
     # Utility callback handlers must be registered before the general anime UI handler.
     app.add_handler(CallbackQueryHandler(font_style_callback, pattern=r"^font:(?!back$)[a-z_]+$"))
     app.add_handler(CallbackQueryHandler(font_back_callback, pattern=r"^font:back$"))
+    app.add_handler(ChatMemberHandler(chat_membership_update, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(
         MessageHandler(
             (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.Sticker.ALL |
@@ -2153,6 +2227,7 @@ def build_app():
         )
     )
     app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_error_handler(error_handler)
     return app
 
 

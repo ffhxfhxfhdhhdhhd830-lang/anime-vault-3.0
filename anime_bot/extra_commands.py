@@ -11,10 +11,14 @@ import logging
 import os
 import re
 import sys
+import asyncio
+from datetime import datetime, timezone
 from collections import deque
+from urllib.parse import quote_plus
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
@@ -72,7 +76,37 @@ async def _log_event(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     try:
         await context.bot.send_message(chat_id=channel_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
     except TelegramError as exc:
-        LOG.warning("LOG_CHANNEL delivery failed (%s)", type(exc).__name__)
+        LOG.warning("LOG_CHANNEL delivery failed (%s): %s", type(exc).__name__, exc)
+
+
+async def _record_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.effective_message
+    if user and message:
+        await _log_event(
+            context,
+            "🧭 <b>Command used</b>\n"
+            f"Command: <code>{html.escape(message.text or '')}</code>\n"
+            f"User: {html.escape(user.full_name or 'Unknown')} "
+            f"(<code>{user.id}</code>)",
+        )
+
+
+async def _is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat, user = update.effective_chat, update.effective_user
+    if not chat or not user or chat.type not in {"group", "supergroup"}:
+        return False
+    if user.id == context.application.bot_data["settings"].owner_telegram_id:
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except TelegramError:
+        return False
+    return member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
+
+
+async def _owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return await _has_access(update, context, owner_only=True)
 
 
 def _font_text(value: str, style: str) -> str:
@@ -247,6 +281,341 @@ async def pending_media_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await _upload_media(message, context)
         else:
             await message.reply_text("Only photos and videos are supported. Send one or use /cancel.")
+
+
+async def repo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _has_access(update, context):
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        return await update.effective_message.reply_text("Usage: /repo <search terms>")
+    status = await update.effective_message.reply_text("Searching GitHub…")
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.get(
+                "https://api.github.com/search/repositories",
+                params={"q": query, "sort": "stars", "per_page": 1},
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        items = data.get("items") or []
+        if not items:
+            return await status.edit_text("No matching GitHub repositories found.")
+        item = items[0]
+        description = html.escape(str(item.get("description") or "No description"))
+        name = html.escape(str(item.get("full_name") or item.get("name") or "Repository"))
+        language = html.escape(str(item.get("language") or "Unknown"))
+        text = (
+            f"<b>{name}</b>\n{description}\n\n"
+            f"⭐ {item.get('stargazers_count', 0)} · "
+            f"🍴 {item.get('forks_count', 0)} · "
+            f"Open issues: {item.get('open_issues_count', 0)}\n"
+            f"Language: {language}\n"
+            f"<a href=\"{html.escape(str(item.get('html_url', '')), quote=True)}\">Open repository</a>"
+        )
+        await status.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    except (httpx.HTTPError, ValueError) as exc:
+        LOG.warning("GitHub repository search failed (%s)", type(exc).__name__)
+        await status.edit_text("GitHub search is unavailable right now. Try again later.")
+
+
+async def imdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _has_access(update, context):
+        return
+    title = " ".join(context.args or []).strip()
+    if not title:
+        return await update.effective_message.reply_text("Usage: /imdb <anime title>")
+    db = context.application.bot_data["db"]
+    # Show verified catalogue data, and link directly to IMDb's title search.
+    # We do not invent IMDb scores when the catalogue has no verified IMDb ID/rating.
+    from anime_bot.services.core import AnimeService
+
+    rows = await AnimeService(db).search(title, limit=5)
+    query_url = "https://www.imdb.com/find/?q=" + quote_plus(title)
+    if not rows:
+        await update.effective_message.reply_text(
+            "No exact catalogue match. Search IMDb for the title here:",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Search IMDb", url=query_url)]]
+            ),
+        )
+        return
+    anime = rows[0]
+    name = html.escape(str(anime.get("title") or title))
+    genres = html.escape(", ".join(anime.get("genres") or []) or "Not listed")
+    fmt = html.escape(str(anime.get("format") or "Unknown"))
+    synopsis = html.escape(str(anime.get("synopsis") or "Synopsis unavailable"))
+    try:
+        rating = float(anime.get("imdb_rating"))
+        rating_text = f"IMDb rating: {rating:g}/10\n" if 0 <= rating <= 10 else ""
+    except (TypeError, ValueError):
+        rating_text = ""
+    imdb_id = str(anime.get("imdb_id") or "")
+    imdb_url = f"https://www.imdb.com/title/{imdb_id}/" if re.fullmatch(r"tt\d+", imdb_id) else query_url
+    await update.effective_message.reply_text(
+        f"<b>{name}</b>\nFormat: {fmt}\nGenres: {genres}\n{rating_text}\n{synopsis}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open IMDb", url=imdb_url)]]),
+        disable_web_page_preview=True,
+    )
+
+
+async def all_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _owner(update, context):
+        return
+    db = context.application.bot_data["db"]
+    rows = await db.users.find({}).sort("user_id", 1).limit(100).to_list(100)
+    if not rows:
+        return await update.effective_message.reply_text("No users are registered yet.")
+    lines = [f"<code>{row.get('user_id')}</code>  {html.escape(str(row.get('first_name') or 'Unknown'))}" for row in rows]
+    await update.effective_message.reply_text(
+        "<b>Registered users (first 100)</b>\n" + "\n".join(lines), parse_mode="HTML"
+    )
+
+
+async def chats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _owner(update, context):
+        return
+    db = context.application.bot_data["db"]
+    rows = await db.chats.find({}).sort("title", 1).limit(100).to_list(100)
+    if not rows:
+        return await update.effective_message.reply_text("No groups or channels have been recorded yet.")
+    lines = [
+        f"{html.escape(str(row.get('title') or 'Untitled'))} · "
+        f"{html.escape(str(row.get('chat_type') or 'group'))} · "
+        f"<code>{row.get('chat_id')}</code>"
+        for row in rows
+    ]
+    await update.effective_message.reply_text(
+        f"<b>Known chats ({len(rows)})</b>\n" + "\n".join(lines), parse_mode="HTML"
+    )
+
+
+async def channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _owner(update, context):
+        return
+    db = context.application.bot_data["db"]
+    rows = await db.chats.find({"chat_type": "channel", "bot_status": {"$ne": "left"}}).limit(100).to_list(100)
+    if not rows:
+        return await update.effective_message.reply_text("No channels are connected yet.")
+    lines = [f"{html.escape(str(row.get('title') or 'Untitled channel'))} · <code>{row.get('chat_id')}</code>" for row in rows]
+    await update.effective_message.reply_text(
+        f"<b>Connected channels: {len(rows)}</b>\n" + "\n".join(lines), parse_mode="HTML"
+    )
+
+
+async def logtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _owner(update, context):
+        return
+    settings = context.application.bot_data["settings"]
+    if settings.log_channel_id is None:
+        return await update.effective_message.reply_text("LOG_CHANNEL is empty in this process's environment.")
+    try:
+        sent = await context.bot.send_message(
+            chat_id=settings.log_channel_id,
+            text=f"✅ LOG_CHANNEL test passed. Bot ID: <code>{context.bot.id}</code>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        LOG.exception("LOG_CHANNEL test delivery failed")
+        return await update.effective_message.reply_text(
+            f"Could not post to LOG_CHANNEL ({type(exc).__name__}). Check the bot's channel permissions and the numeric channel ID."
+        )
+    await update.effective_message.reply_text(f"Test message delivered (Telegram message ID {sent.message_id}).")
+
+
+async def _connection_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        if chat.type not in {"group", "supergroup"}:
+            await update.effective_message.reply_text("Connections are for groups and supergroups.")
+            return False
+        member = await context.bot.get_chat_member(chat_id, update.effective_user.id)
+        if member.status not in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
+            await update.effective_message.reply_text("You must be an administrator of that group.")
+            return False
+        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if bot_member.status not in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
+            await update.effective_message.reply_text("Add the bot as a group administrator first.")
+            return False
+    except TelegramError:
+        await update.effective_message.reply_text("I can’t access that group. Check its ID and add me there as an administrator.")
+        return False
+    return True
+
+
+async def connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"}:
+        target_id = chat.id
+    elif context.args and re.fullmatch(r"-?\d+", context.args[0]):
+        target_id = int(context.args[0])
+    else:
+        return await update.effective_message.reply_text("Usage in private chat: /connect <group_id>\nIn the group, send /connect.")
+    if not await _connection_admin(update, context, target_id):
+        return
+    db = context.application.bot_data["db"]
+    group = await context.bot.get_chat(target_id)
+    await db.connections.update_one(
+        {"user_id": update.effective_user.id, "chat_id": target_id},
+        {"$setOnInsert": {"user_id": update.effective_user.id, "chat_id": target_id, "title": group.title, "connected_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    await db.chats.update_one(
+        {"chat_id": target_id},
+        {"$set": {"chat_id": target_id, "title": group.title, "chat_type": group.type, "bot_status": "administrator", "last_seen_at": datetime.now(timezone.utc)}, "$setOnInsert": {"registered_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    await update.effective_message.reply_text(f"Connected to {group.title or target_id}.")
+
+
+async def connections_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _has_access(update, context):
+        return
+    db = context.application.bot_data["db"]
+    rows = await db.connections.find({"user_id": update.effective_user.id}).sort("connected_at", -1).to_list(100)
+    if not rows:
+        return await update.effective_message.reply_text("No connected groups. Use /connect <group_id> in private chat or /connect in a group where you are an admin.")
+    lines = [f"{html.escape(str(row.get('title') or 'Group'))} · <code>{row['chat_id']}</code>" for row in rows]
+    await update.effective_message.reply_text("<b>Your connected groups</b>\n" + "\n".join(lines), parse_mode="HTML")
+
+
+async def disconnect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"}:
+        target_id = chat.id
+    elif context.args and re.fullmatch(r"-?\d+", context.args[0]):
+        target_id = int(context.args[0])
+    else:
+        return await update.effective_message.reply_text("Usage: /disconnect <group_id> in private chat, or /disconnect in the group.")
+    if chat and chat.type in {"group", "supergroup"}:
+        if not await _is_chat_admin(update, context):
+            return await update.effective_message.reply_text("Group administrators only.")
+    db = context.application.bot_data["db"]
+    result = await db.connections.delete_one({"user_id": update.effective_user.id, "chat_id": target_id})
+    await update.effective_message.reply_text("Disconnected." if result.deleted_count else "That group is not connected to your account.")
+
+
+async def _toggle_group(update: Update, context: ContextTypes.DEFAULT_TYPE, disabled: bool) -> None:
+    chat = update.effective_chat
+    if not chat or chat.type not in {"group", "supergroup"}:
+        return await update.effective_message.reply_text("Use this command inside the group.")
+    if not await _is_chat_admin(update, context):
+        return await update.effective_message.reply_text("Group administrators only.")
+    db = context.application.bot_data["db"]
+    now = datetime.now(timezone.utc)
+    await db.chats.update_one(
+        {"chat_id": chat.id},
+        {"$set": {"chat_id": chat.id, "title": chat.title, "chat_type": chat.type, "disabled": disabled, "last_seen_at": now}, "$setOnInsert": {"registered_at": now}},
+        upsert=True,
+    )
+    await update.effective_message.reply_text("Bot commands disabled in this group." if disabled else "Bot commands enabled in this group.")
+
+
+async def disable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _toggle_group(update, context, True)
+
+
+async def enable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _toggle_group(update, context, False)
+
+
+async def leave_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat or chat.type not in {"group", "supergroup"}:
+        return await update.effective_message.reply_text("Use /leave inside the group you want me to leave.")
+    if not await _is_chat_admin(update, context):
+        return await update.effective_message.reply_text("Group administrators only.")
+    await update.effective_message.reply_text("Leaving this group.")
+    await context.bot.leave_chat(chat.id)
+    await context.application.bot_data["db"].chats.update_one(
+        {"chat_id": chat.id}, {"$set": {"bot_status": "left", "last_seen_at": datetime.now(timezone.utc)}}
+    )
+
+
+async def chat_membership_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    member_update = update.my_chat_member
+    if not member_update:
+        return
+    chat = member_update.chat
+    new_status = member_update.new_chat_member.status
+    old_status = member_update.old_chat_member.status
+    now = datetime.now(timezone.utc)
+    db = context.application.bot_data["db"]
+    chat_doc = {
+        "chat_id": chat.id,
+        "title": chat.title or chat.full_name or "Untitled chat",
+        "chat_type": chat.type,
+        "bot_status": new_status.value,
+        "last_seen_at": now,
+    }
+    await db.chats.update_one(
+        {"chat_id": chat.id},
+        {"$set": chat_doc, "$setOnInsert": {"registered_at": now}},
+        upsert=True,
+    )
+    if old_status in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED} and new_status not in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}:
+        await _log_event(
+            context,
+            "➕ <b>Anime Vault added to a chat</b>\n"
+            f"Name: {html.escape(chat_doc['title'])}\nType: {chat.type}\n"
+            f"Chat ID: <code>{chat.id}</code>",
+        )
+    elif new_status in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}:
+        await _log_event(
+            context,
+            f"➖ <b>Anime Vault removed from a chat</b>\nChat ID: <code>{chat.id}</code>",
+        )
+
+
+async def _broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, *, groups: bool) -> None:
+    if not await _owner(update, context):
+        return
+    message = update.effective_message
+    args = context.args or []
+    if not args or args[0].upper() != "CONFIRM":
+        name = "groups" if groups else "users"
+        return await message.reply_text(
+            f"This sends a message to all registered {name}. To confirm, reply to the message you want to send and use /{'grp_broadcast' if groups else 'broadcast'} CONFIRM, or send /{'grp_broadcast' if groups else 'broadcast'} CONFIRM <text>."
+        )
+    text = " ".join(args[1:]).strip()
+    source = message.reply_to_message
+    if not text and not source:
+        return await message.reply_text("Reply to a message or add text after CONFIRM.")
+    db = context.application.bot_data["db"]
+    if groups:
+        rows = await db.chats.find({"chat_type": {"$in": ["group", "supergroup"]}, "bot_status": {"$nin": ["left", "kicked"]}}).to_list(5000)
+        targets = [int(row["chat_id"]) for row in rows if row.get("chat_id")]
+    else:
+        rows = await db.users.find({}).to_list(10000)
+        targets = [int(row["user_id"]) for row in rows if row.get("user_id")]
+    status = await message.reply_text(f"Sending to {len(targets)} {'groups' if groups else 'users'}…")
+    success = failed = 0
+    for target in targets:
+        try:
+            if source:
+                await context.bot.copy_message(
+                    chat_id=target,
+                    from_chat_id=source.chat_id,
+                    message_id=source.message_id,
+                )
+            else:
+                await context.bot.send_message(chat_id=target, text=text)
+            success += 1
+        except TelegramError:
+            failed += 1
+        await asyncio.sleep(0.05)
+    await status.edit_text(f"Broadcast finished. Sent: {success}; failed: {failed}.")
+
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _broadcast(update, context, groups=False)
+
+
+async def grp_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _broadcast(update, context, groups=True)
 
 
 async def _upload_media(message, context: ContextTypes.DEFAULT_TYPE) -> None:
