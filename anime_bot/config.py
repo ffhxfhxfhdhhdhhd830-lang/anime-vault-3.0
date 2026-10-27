@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     )
     log_channel: str = Field(default="", alias="LOG_CHANNEL")
     pics: str = Field(default="", alias="PICS")
+    start_sticker: str = Field(default="", alias="START_STICKER")
     cache_ttl_seconds: int = Field(default=21600, alias="CACHE_TTL_SECONDS", ge=60)
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     allow_groups: bool = Field(default=False, alias="ALLOW_GROUPS")

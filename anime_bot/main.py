@@ -58,6 +58,8 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("anime_bot")
 LOADING_FRAMES = ("▣☐☐", "☐▣☐", "☐☐▣")
+START_REACTIONS = ("👋", "✨", "😊", "💖", "🎉", "🔥", "🌸", "👍")
+START_LOADING_FRAMES = ("✨", "👀", "<b>Starting Anime Vault…</b>")
 
 
 async def _animate_loading(message, stop_event, label="Loading", interval=0.5):
@@ -1241,10 +1243,16 @@ async def start(update, context):
     settings = context.application.bot_data["settings"]
     if not user or not chat:
         return
-    if chat.type != "private" and not settings.allow_groups:
-        return await update.effective_message.reply_text(
-            "Please use me in a private chat."
+    message = update.effective_message
+    try:
+        await message.set_reaction(
+            reaction=random.choice(START_REACTIONS), is_big=True
         )
+    except TelegramError as exc:
+        # Reactions depend on Telegram chat settings; they must not block /start.
+        log.debug("Could not react to /start (%s)", type(exc).__name__)
+    if chat.type != "private" and not settings.allow_groups:
+        return await message.reply_text("Please use me in a private chat.")
     db = context.application.bot_data["db"]
     now = datetime.now(timezone.utc)
     await db.users.update_one(
@@ -1293,6 +1301,31 @@ async def start(update, context):
                 f"Name: {html.escape(chat.title or 'Untitled group')}\n"
                 f"Chat ID: <code>{chat.id}</code>",
             )
+    else:
+        # Brief startup animation, followed by an optional bot-owned sticker.
+        # Telegram sticker file IDs are bot-specific, so configure START_STICKER
+        # using an ID obtained from this bot (for example, with /stickerid).
+        try:
+            loading = await message.reply_text("Welcome to Anime Vault…")
+            for frame in START_LOADING_FRAMES:
+                await asyncio.sleep(0.4)
+                await loading.edit_text(frame, parse_mode=ParseMode.HTML)
+            await asyncio.sleep(0.3)
+            await loading.delete()
+        except TelegramError as exc:
+            log.debug("Could not complete /start animation (%s)", type(exc).__name__)
+
+        sticker_id = settings.start_sticker.strip()
+        if sticker_id:
+            try:
+                sticker = await message.reply_sticker(sticker_id)
+                await asyncio.sleep(1)
+                await sticker.delete()
+            except TelegramError as exc:
+                log.warning(
+                    "Could not send configured START_STICKER (%s)",
+                    type(exc).__name__,
+                )
     welcome = welcome_text(user.first_name)
     _set_current(context, {"kind": "home"}, reset=True)
     await render(update, welcome, home_markup())

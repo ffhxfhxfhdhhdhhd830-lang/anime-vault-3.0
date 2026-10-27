@@ -6,7 +6,7 @@ A private, MongoDB-backed Telegram tracker. The project works without external m
 
 1. Install Python 3.12 from python.org and MongoDB locally or use MongoDB Atlas. In Atlas, create a database user with read/write access only to the chosen database, enable TLS, and allow your machine's IP.
 2. Create a bot with `@BotFather`. Send `/whoami` to this bot after it starts to get your numeric Telegram ID (or obtain it from a trusted ID bot). Do not publish it.
-3. Copy `.env.example` to `.env`, then set the token, owner ID and MongoDB URI. Optionally set `LOG_CHANNEL` to the channel's numeric chat ID (usually starts with `-100`) and `PICS` to a space-separated list of image URLs or Telegram file IDs. Add the bot to the log channel as an administrator with permission to post. Keep `.env` private; it is excluded from Git. `/logs` shows only a bounded in-memory warning/error tail and redacts common secret patterns; it does not expose `.env`.
+3. Copy `.env.example` to `.env`, then set the token, owner ID and MongoDB URI. Optionally set `LOG_CHANNEL` to the channel's numeric chat ID (usually starts with `-100`), `PICS` to a space-separated list of image URLs or Telegram file IDs, and `START_STICKER` to a sticker file ID obtained from this bot with `/stickerid`. The bot reacts to `/start`, shows a brief welcome animation, sends the configured sticker, then displays its welcome screen. Add the bot to the log channel as an administrator with permission to post. Keep `.env` private; it is excluded from Git. `/logs` shows only a bounded in-memory warning/error tail and redacts common secret patterns; it does not expose `.env`.
 4. From PowerShell in this directory:
 
 ```powershell
