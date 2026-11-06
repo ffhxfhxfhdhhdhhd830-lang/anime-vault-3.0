@@ -42,4 +42,5 @@ async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     await db.reviews.create_index([("user_id", 1), ("anime_id", 1)], unique=True)
     await db.reminders.create_index([("due_at", 1), ("sent_at", 1), ("cancelled_at", 1)])
     await db.reminders.create_index([("user_id", 1), ("due_at", 1)])
+    await db.airing_notifications.create_index([("user_id", 1), ("anime_id", 1), ("episode", 1)], unique=True)
 
