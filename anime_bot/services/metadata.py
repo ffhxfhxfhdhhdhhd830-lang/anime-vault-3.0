@@ -1,6 +1,7 @@
 """Optional, source-labelled TMDb metadata and watch-provider adapter."""
 
 from difflib import SequenceMatcher
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -159,9 +160,17 @@ class MetadataService:
         )
 
     async def watch_offers(self, anime: dict[str, Any], region: str):
+        region = region.upper()
+        cache_key = str(anime.get("_id") or normalize(str(anime.get("title") or "")))
+        now = datetime.now(timezone.utc)
+        cached = await self.db.streaming.find_one(
+            {"cache_key": cache_key, "region": region, "expires_at": {"$gt": now}}
+        )
+        if cached:
+            return cached.get("payload", {"region": region, "offers": [], "available": False})
         resolved = await self._resolve(anime)
         if not resolved:
-            return {"region": region.upper(), "offers": [], "available": False}
+            return {"region": region, "offers": [], "available": False}
         kind, tmdb_id = resolved
         if anime.get("_id") is not None:
             await self.db.anime.update_one(
@@ -169,7 +178,7 @@ class MetadataService:
                 {"$set": {"tmdb_id": tmdb_id, "tmdb_media_type": kind}},
             )
         body = await self._get(f"/{kind}/{tmdb_id}/watch/providers")
-        region_data = (body or {}).get("results", {}).get(region.upper(), {})
+        region_data = (body or {}).get("results", {}).get(region, {})
         offers = []
         for access_type in ("flatrate", "free", "ads", "rent", "buy"):
             for provider in region_data.get(access_type, []):
@@ -181,10 +190,22 @@ class MetadataService:
                         "type": access_type,
                     }
                 )
-        return {
-            "region": region.upper(),
+        payload = {
+            "region": region,
             "offers": offers,
             "link": region_data.get("link"),
             "available": bool(offers),
         }
+        await self.db.streaming.update_one(
+            {"cache_key": cache_key, "region": region},
+            {"$set": {
+                "cache_key": cache_key,
+                "region": region,
+                "payload": payload,
+                "expires_at": now + timedelta(hours=6),
+                "updated_at": now,
+            }},
+            upsert=True,
+        )
+        return payload
 
