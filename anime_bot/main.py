@@ -4,6 +4,7 @@ import logging
 import random
 import re
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 from urllib.parse import quote_plus
 
@@ -24,6 +25,7 @@ from anime_bot.services.core import (
 )
 from anime_bot.services.genres import CANONICAL_GENRES, genres_for, normalize_genres
 from anime_bot.services.metadata import MetadataService
+from anime_bot.services.advanced import TrackingService, ReviewService, ReminderService
 from anime_bot.services.anilist import AniListService, watched_titles
 from anime_bot.extra_commands import (
     font_back_callback,
@@ -2098,6 +2100,7 @@ async def post_init(app):
         upsert=True,
     )
     await seed_confirmed_titles(mongo.db, settings.owner_telegram_id)
+    app.bot_data["reminder_task"] = app.create_task(_reminder_worker(app), name="anime-reminders")
     await _log_channel_event(
         SimpleNamespace(application=app, bot=app.bot),
         f"✅ <b>Anime Vault started</b>\nBot ID: <code>{app.bot.id}</code>",
@@ -2127,6 +2130,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_shutdown(app):
+    reminder_task = app.bot_data.get("reminder_task")
+    if reminder_task and not reminder_task.done():
+        reminder_task.cancel()
     if app.bot_data.get("metadata"):
         await app.bot_data["metadata"].close()
     if app.bot_data.get("anilist"):
@@ -2149,11 +2155,6 @@ async def _streaming_cmd(update, context):
         )
 
 
-async def _reminders_cmd(update, context):
-    if await allowed(update, context):
-        await update.message.reply_text("Reminders are disabled until configured.")
-
-
 async def _cancel_cmd(update, context):
     if await allowed(update, context):
         sticker_pending = context.user_data.pop("awaiting_sticker", None)
@@ -2163,6 +2164,160 @@ async def _cancel_cmd(update, context):
             if sticker_pending or telegraph_pending
             else "No active workflow."
         )
+
+
+
+async def episode_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    args = context.args
+    if len(args) < 2 or not args[-1].isdigit():
+        return await update.effective_message.reply_text(
+            "Use /episode <anime title> <episode number>\nExample: /episode Frieren 5"
+        )
+    title = " ".join(args[:-1]).strip()
+    episode = int(args[-1])
+    if episode < 1:
+        return await update.effective_message.reply_text("Episode number must be 1 or higher.")
+    db = context.application.bot_data["db"]
+    matches = await AnimeService(db).search(title, limit=10)
+    anime = next((x for x in matches if x.get("title_norm") == normalize(title)), None)
+    if not anime:
+        return await update.effective_message.reply_text("I couldn't find an exact title. Add it first with /add.")
+    try:
+        added, count = await TrackingService(db).log_episode(
+            update.effective_user.id, str(anime["_id"]), episode
+        )
+    except ValueError as exc:
+        return await update.effective_message.reply_text(str(exc))
+    if not added:
+        return await update.effective_message.reply_text(
+            f"Episode {episode} of {anime['title']} was already marked watched. Progress: {count} distinct episodes."
+        )
+    await update.effective_message.reply_text(
+        f"✅ Marked episode {episode} of {anime['title']} as watched.\nProgress: {count} distinct episodes."
+    )
+
+
+async def undo_episode_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    title = " ".join(context.args).strip()
+    if not title:
+        return await update.effective_message.reply_text("Use /undoepisode <anime title>")
+    db = context.application.bot_data["db"]
+    matches = await AnimeService(db).search(title, limit=10)
+    anime = next((x for x in matches if x.get("title_norm") == normalize(title)), None)
+    if not anime:
+        return await update.effective_message.reply_text("I couldn't find an exact title.")
+    result = await TrackingService(db).undo_last_episode(update.effective_user.id, str(anime["_id"]))
+    if not result:
+        return await update.effective_message.reply_text("There is no recent episode entry to undo.")
+    episode, count = result
+    await update.effective_message.reply_text(
+        f"↩️ Undid episode {episode} for {anime['title']}. Progress: {count} distinct episodes."
+    )
+
+
+async def review_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    raw = " ".join(context.args).strip()
+    parts = [part.strip() for part in raw.split("|", maxsplit=1)]
+    head = parts[0].split()
+    if len(head) < 5 or not all(x.isdigit() for x in head[-4:]):
+        return await update.effective_message.reply_text(
+            "Use /review <anime title> <story> <animation> <music> <overall> | optional review text\n"
+            "Example: /review Frieren 9 10 9 10 | Beautiful storytelling."
+        )
+    title = " ".join(head[:-4]).strip()
+    scores = dict(zip(("story", "animation", "music", "overall"), map(int, head[-4:])))
+    text = parts[1] if len(parts) > 1 else ""
+    db = context.application.bot_data["db"]
+    matches = await AnimeService(db).search(title, limit=10)
+    anime = next((x for x in matches if x.get("title_norm") == normalize(title)), None)
+    if not anime:
+        return await update.effective_message.reply_text("I couldn't find an exact title. Add it first with /add.")
+    try:
+        await ReviewService(db).save(update.effective_user.id, str(anime["_id"]), scores, text)
+    except ValueError as exc:
+        return await update.effective_message.reply_text(str(exc))
+    await update.effective_message.reply_text(
+        f"⭐ Review saved for {anime['title']}\nStory {scores['story']}/10 · Animation {scores['animation']}/10\n"
+        f"Music {scores['music']}/10 · Overall {scores['overall']}/10"
+    )
+
+
+async def remind_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    raw = " ".join(context.args).strip()
+    parts = [part.strip() for part in raw.split("|", maxsplit=1)]
+    if len(parts) != 2 or len(parts[0].split()) < 3:
+        return await update.effective_message.reply_text(
+            "Use /remind YYYY-MM-DD HH:MM | reminder title\nExample: /remind 2026-11-07 20:00 | Watch Frieren"
+        )
+    date_text, time_text = parts[0].split(maxsplit=1)
+    try:
+        settings = context.application.bot_data["settings"]
+        local_due = datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M").replace(
+            tzinfo=ZoneInfo(settings.timezone)
+        )
+        reminder_id = await ReminderService(context.application.bot_data["db"]).create(
+            update.effective_user.id, local_due, parts[1]
+        )
+    except (ValueError, KeyError) as exc:
+        return await update.effective_message.reply_text(f"Could not create reminder: {exc}")
+    await update.effective_message.reply_text(
+        f"🔔 Reminder saved for {local_due.strftime('%Y-%m-%d %H:%M %Z')}. ID: {reminder_id}"
+    )
+
+
+async def reminders_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    service = ReminderService(context.application.bot_data["db"])
+    rows = await service.list(update.effective_user.id)
+    if not rows:
+        return await update.effective_message.reply_text("You have no upcoming reminders.")
+    settings = context.application.bot_data["settings"]
+    zone = ZoneInfo(settings.timezone)
+    lines = ["🔔 Your upcoming reminders:"]
+    for row in rows:
+        due = row["due_at"].astimezone(zone)
+        lines.append(f"• {due:%d %b %Y, %H:%M} — {html.escape(row['title'])} (ID: {row['_id']})")
+    lines.append("Cancel one with /cancelreminder <ID>.")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cancel_reminder_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    reminder_id = context.args[0] if context.args else ""
+    if not reminder_id:
+        return await update.effective_message.reply_text("Use /cancelreminder <reminder ID>")
+    ok = await ReminderService(context.application.bot_data["db"]).cancel(
+        update.effective_user.id, reminder_id
+    )
+    await update.effective_message.reply_text("Reminder cancelled." if ok else "Reminder not found or already sent/cancelled.")
+
+
+async def _reminder_worker(app):
+    service = ReminderService(app.bot_data["db"])
+    while True:
+        reminder = await service.claim_due(datetime.now(timezone.utc))
+        if not reminder:
+            await asyncio.sleep(15)
+            continue
+        try:
+            await app.bot.send_message(
+                chat_id=reminder["user_id"],
+                text="🔔 Reminder: " + reminder["title"] +
+                     (("\\n" + reminder["note"]) if reminder.get("note") else ""),
+            )
+        except TelegramError as exc:
+            log.warning("Reminder delivery failed (%s)", type(exc).__name__)
+            await service.release_claim(reminder["_id"])
 
 
 def build_app():
@@ -2209,9 +2364,14 @@ def build_app():
         "favorites": favorites_cmd,
         "favourites": favorites_cmd,
         "progress": lambda u, c: list_cmd(u, c, "watching"),
+        "episode": episode_cmd,
+        "undoepisode": undo_episode_cmd,
+        "review": review_cmd,
+        "remind": remind_cmd,
+        "reminders": reminders_cmd,
+        "cancelreminder": cancel_reminder_cmd,
         "continue": lambda u, c: list_cmd(u, c, "watching"),
         "streaming": _streaming_cmd,
-        "reminders": _reminders_cmd,
         "settings": _settings_cmd,
         "export": export_cmd,
         "import": import_cmd,
