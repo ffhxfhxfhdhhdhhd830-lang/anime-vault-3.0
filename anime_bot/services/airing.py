@@ -19,7 +19,7 @@ query ($search: String!) {
   Media(search: $search, type: ANIME, isAdult: false) {
     id
     title { english romaji }
-    airingSchedule(notYetAired: false, page: 1, perPage: 1) {
+    airingSchedule(notYetAired: true, page: 1, perPage: 1) {
       nodes { episode airingAt }
     }
   }
