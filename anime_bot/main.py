@@ -2313,8 +2313,9 @@ async def _reminder_worker(app):
             await app.bot.send_message(
                 chat_id=reminder["user_id"],
                 text="🔔 Reminder: " + reminder["title"] +
-                     (("\\n" + reminder["note"]) if reminder.get("note") else ""),
+                     (("\n" + reminder["note"]) if reminder.get("note") else ""),
             )
+            await service.mark_sent(reminder["_id"], datetime.now(timezone.utc))
         except TelegramError as exc:
             log.warning("Reminder delivery failed (%s)", type(exc).__name__)
             await service.release_claim(reminder["_id"])
