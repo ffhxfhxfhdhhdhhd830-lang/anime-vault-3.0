@@ -5,7 +5,6 @@ from typing import Any
 
 from bson import ObjectId
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
 
 from anime_bot.services.core import normalize
 
@@ -38,7 +37,7 @@ class TrackingService:
             upsert=True,
         )
         row = await self.db.progress.find_one(key) or {}
-        if not result.modified_count:
+        if not result.modified_count and result.upserted_id is None:
             return False, len(set(row.get("watched_episodes", [])))
         await self.db.progress.update_one(key, {"$set": {"updated_at": now}})
         watched = sorted(set(row.get("watched_episodes", [])))
@@ -143,7 +142,7 @@ class ReminderService:
             raise ValueError("Title is required (max 120 characters); note limit is 500.")
         result = await self.db.reminders.insert_one({
             "user_id": user_id, "due_at": due_at.astimezone(timezone.utc),
-            "title": title, "note": note, "sent_at": None,
+            "title": title, "note": note, "sent_at": None, "claimed_at": None,
             "cancelled_at": None, "created_at": datetime.now(timezone.utc),
         })
         return str(result.inserted_id)
@@ -163,14 +162,28 @@ class ReminderService:
         return bool(result.modified_count)
 
     async def claim_due(self, now: datetime) -> dict | None:
+        # A five-minute lease lets another worker retry after a process crash.
+        from datetime import timedelta
+        lease_cutoff = now - timedelta(minutes=5)
         return await self.db.reminders.find_one_and_update(
-            {"due_at": {"$lte": now}, "sent_at": None, "cancelled_at": None},
-            {"$set": {"sent_at": now}},
+            {
+                "due_at": {"$lte": now},
+                "sent_at": None,
+                "cancelled_at": None,
+                "$or": [{"claimed_at": None}, {"claimed_at": {"$lte": lease_cutoff}}],
+            },
+            {"$set": {"claimed_at": now}},
             sort=[("due_at", 1)],
             return_document=ReturnDocument.AFTER,
         )
 
+    async def mark_sent(self, reminder_id: ObjectId, sent_at: datetime) -> None:
+        await self.db.reminders.update_one(
+            {"_id": reminder_id, "sent_at": None},
+            {"$set": {"sent_at": sent_at}, "$unset": {"claimed_at": ""}},
+        )
+
     async def release_claim(self, reminder_id: ObjectId) -> None:
         await self.db.reminders.update_one(
-            {"_id": reminder_id}, {"$set": {"sent_at": None}}
+            {"_id": reminder_id}, {"$unset": {"claimed_at": ""}}
         )
