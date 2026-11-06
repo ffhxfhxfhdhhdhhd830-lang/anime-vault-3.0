@@ -269,48 +269,74 @@ class WatchlistService:
 
 
 class RecommendationService:
+    """Rank unseen catalogue entries from a user's explicit taste signals."""
+
     def __init__(self, db: Any):
         self.db = db
 
     async def recommend(
         self, user_id: int, limit: int = 5, genre: str | None = None
     ) -> list[tuple[dict, str]]:
+        limit = max(1, min(int(limit), 25))
         user_rows = await self.db.watchlist.find({"user_id": user_id}).to_list(2000)
-        excluded = {str(x["anime_id"]) for x in user_rows}
-        liked_genres: set[str] = set()
+        excluded = {str(row["anime_id"]) for row in user_rows}
+        preferences: dict[str, float] = {}
         for row in user_rows:
-            if (
-                row.get("status") == "completed"
-                or row.get("favourite")
-                or (row.get("rating") or 0) >= 8
-            ):
-                anime = await self.db.anime.find_one({"_id": row["anime_id"]})
-                liked_genres.update(g.casefold() for g in genres_for(anime or {}))
+            rating = row.get("rating")
+            status = row.get("status")
+            if isinstance(rating, (int, float)) and not isinstance(rating, bool):
+                weight = (float(rating) - 5.5) / 2.0
+            elif status == "completed":
+                weight = 0.8
+            else:
+                weight = 0.0
+            if row.get("favourite"):
+                weight += 1.5
+            if status == "dropped":
+                weight -= 1.0
+            if weight == 0:
+                continue
+            anime = await self.db.anime.find_one({"_id": row["anime_id"]})
+            for value in genres_for(anime or {}):
+                key = value.casefold()
+                preferences[key] = preferences.get(key, 0.0) + weight
+
         candidates = await self.db.anime.find({}).limit(5000).to_list(5000)
         scored = []
         for anime in candidates:
             if str(anime["_id"]) in excluded:
                 continue
-            normalized_genres = {g.casefold() for g in genres_for(anime)}
-            if genre and genre.casefold() not in normalized_genres:
+            candidate_genres = {value.casefold() for value in genres_for(anime)}
+            if genre and genre.casefold() not in candidate_genres:
                 continue
-            overlap = liked_genres.intersection(normalized_genres)
-            score = len(overlap)
-            scored.append((score, anime, bool(overlap)))
-        scored.sort(key=lambda x: (-x[0], x[1].get("title", "").casefold()))
-        return [
-            (
-                a,
-                "Matches your preferred genres"
-                if matched
-                else (
-                    "Genre match; suggestions are not personalized yet"
-                    if not liked_genres
-                    else "Selected genre match"
-                ),
+            if not candidate_genres:
+                continue
+            score = sum(preferences.get(value, 0.0) for value in candidate_genres)
+            positive = sorted(
+                (value for value in candidate_genres if preferences.get(value, 0.0) > 0),
+                key=lambda value: preferences[value],
+                reverse=True,
             )
-            for _, a, matched in scored[:limit]
-        ]
+            negative = sorted(
+                (value for value in candidate_genres if preferences.get(value, 0.0) < 0),
+                key=lambda value: preferences[value],
+            )
+            scored.append((score, anime, positive, negative))
+        scored.sort(
+            key=lambda item: (-item[0], item[1].get("title", "").casefold())
+        )
+        results = []
+        for score, anime, positive, negative in scored[:limit]:
+            if positive:
+                reason = "Because you enjoy " + ", ".join(value.title() for value in positive[:2])
+            elif negative:
+                reason = "Explore something different from " + ", ".join(value.title() for value in negative[:2])
+            elif preferences:
+                reason = "A fresh pick from your selected genre"
+            else:
+                reason = "Add ratings or favorites to personalize recommendations"
+            results.append((anime, reason))
+        return results
 
 
 async def seed_confirmed_titles(db: Any, owner_id: int) -> None:
