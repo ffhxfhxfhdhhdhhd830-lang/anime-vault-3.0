@@ -3,7 +3,6 @@
 Schedules are estimates supplied by AniList. Notifications are deduplicated per
 user/title/episode; progress changes only after the user taps Mark watched.
 """
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
