@@ -66,13 +66,10 @@ class WatchlistService:
         patch: dict[str, Any] = {"status": status, "updated_at": now}
         if status == "completed":
             patch["completed_at"] = now
-        if current := await self.db.watchlist.find_one(
-            {"user_id": user_id, "anime_id": ObjectId(anime_id)}
-        ):
-            if status == "rewatching":
-                patch["rewatch_count"] = int(current.get("rewatch_count", 0)) + 1
         key = {"user_id": user_id, "anime_id": ObjectId(anime_id)}
         current = await self.db.watchlist.find_one(key)
+        if current and status == "rewatching":
+            patch["rewatch_count"] = int(current.get("rewatch_count", 0)) + 1
         if current and current.get("status") == status:
             return False
         if current:
