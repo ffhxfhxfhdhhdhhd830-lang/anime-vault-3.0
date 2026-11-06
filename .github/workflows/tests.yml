@@ -19,5 +19,5 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Run tests
         run: python -m pytest -q
-      - name: Check formatting and lint
-        run: python -m ruff check anime_bot tests
+      - name: Check lint
+        run: python -m ruff check anime_bot scripts tests
