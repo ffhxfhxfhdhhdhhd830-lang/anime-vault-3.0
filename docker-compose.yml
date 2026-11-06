@@ -14,9 +14,8 @@ services:
   bot:
     build: .
     env_file: .env
-    # Containers reach one another by Compose service name, not localhost.
-    environment:
-      MONGODB_URI: mongodb://mongo:27017
+    # For Compose, set MONGODB_URI=mongodb://mongo:27017 in .env.
+    # Keeping this in .env also allows MongoDB Atlas connection strings.
     depends_on:
       mongo:
         condition: service_healthy
