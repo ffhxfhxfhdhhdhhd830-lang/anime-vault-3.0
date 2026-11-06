@@ -109,7 +109,7 @@ class ReviewService:
         if set(scores) != set(self.SCORE_FIELDS):
             raise ValueError("Provide story, animation, music, and overall scores.")
         if any(isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 10 for v in scores.values()):
-            raise ValueError("Each review score must be a whole number from 1 to 10.")
+            raise ValueError("Each review score must be a whole number between 1 and 10.")
         text = text.strip()
         if len(text) > 1500:
             raise ValueError("Review text must be 1,500 characters or fewer.")
