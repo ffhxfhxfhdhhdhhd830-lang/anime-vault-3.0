@@ -3,6 +3,7 @@ import html
 import logging
 import random
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from anime_bot.services.genres import CANONICAL_GENRES, genres_for, normalize_ge
 from anime_bot.services.metadata import MetadataService
 from anime_bot.services.advanced import TrackingService, ReviewService, ReminderService
 from anime_bot.services.anilist import AniListService, watched_titles
+from anime_bot.services.airing import AiringService
 from anime_bot.extra_commands import (
     font_back_callback,
     font_cmd,
@@ -1618,6 +1620,14 @@ async def callbacks(update, context):
     parts = data.split(":")
     try:
         action = parts[1]
+        if action == "air" and len(parts) == 4 and ObjectId.is_valid(parts[2]) and parts[3].isdigit():
+            anime_id, episode = parts[2], int(parts[3])
+            service = TrackingService(db)
+            changed, count = await service.log_episode(update.effective_user.id, anime_id, episode)
+            title_row = await db.anime.find_one({"_id": ObjectId(anime_id)}) or {}
+            message = (f"✅ Marked episode {episode} of <b>{html.escape(str(title_row.get('title', 'anime')))}</b> watched.\n"
+                       f"Your recorded episode count: {count}.") if changed else "That episode is already recorded as watched."
+            return await render(update, message, home_markup())
         if action == "home":
             return await _open(update, context, {"kind": "home"}, reset=True)
         if action == "back":
@@ -2091,6 +2101,7 @@ async def post_init(app):
         mongo.db, settings.tmdb_api_key.get_secret_value()
     )
     app.bot_data["anilist"] = AniListService(mongo.db)
+    app.bot_data["airing"] = AiringService(mongo.db)
     await mongo.db.authorized_users.update_one(
         {"user_id": settings.owner_telegram_id},
         {
@@ -2104,6 +2115,7 @@ async def post_init(app):
     )
     await seed_confirmed_titles(mongo.db, settings.owner_telegram_id)
     app.bot_data["reminder_task"] = app.create_task(_reminder_worker(app), name="anime-reminders")
+    app.bot_data["airing_task"] = app.create_task(_airing_worker(app), name="anime-airing")
     await _log_channel_event(
         SimpleNamespace(application=app, bot=app.bot),
         f"✅ <b>Anime Vault started</b>\nBot ID: <code>{app.bot.id}</code>",
@@ -2133,6 +2145,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_shutdown(app):
+    for task_name in ("reminder_task", "airing_task"):
+        task = app.bot_data.get(task_name)
+        if task and not task.done():
+            task.cancel()
     reminder_task = app.bot_data.get("reminder_task")
     if reminder_task and not reminder_task.done():
         reminder_task.cancel()
@@ -2140,6 +2156,8 @@ async def post_shutdown(app):
         await app.bot_data["metadata"].close()
     if app.bot_data.get("anilist"):
         await app.bot_data["anilist"].close()
+    if app.bot_data.get("airing"):
+        await app.bot_data["airing"].close()
     if app.bot_data.get("mongo"):
         await app.bot_data["mongo"].close()
 
@@ -2324,6 +2342,125 @@ async def _reminder_worker(app):
             await service.release_claim(reminder["_id"])
 
 
+async def _airing_worker(app):
+    """Poll upcoming schedules and send one-tap episode confirmations."""
+    service = app.bot_data["airing"]
+    while True:
+        try:
+            async for user_id, item in service.due_notifications():
+                release = item["release_at"].astimezone(ZoneInfo(app.bot_data["settings"].timezone))
+                text = (
+                    f"📺 <b>New episode update</b>\n\n"
+                    f"<b>{html.escape(item['title'])}</b> · Episode {item['episode']}\n"
+                    f"Expected: {release:%d %b %Y, %I:%M %p} ({html.escape(app.bot_data['settings'].timezone)})\n"
+                    f"<i>Schedule supplied by AniList; release times may change.</i>"
+                )
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "✅ Mark watched",
+                        callback_data=f"v1:air:{item['anime_id']}:{item['episode']}",
+                    )
+                ]])
+                try:
+                    await app.bot.send_message(
+                        chat_id=user_id, text=text, parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard, disable_web_page_preview=True,
+                    )
+                except TelegramError:
+                    await app.bot_data["db"].airing_notifications.delete_one({
+                        "user_id": user_id, "anime_id": ObjectId(item["anime_id"]),
+                        "episode": item["episode"],
+                    })
+                    log.warning("Airing notification delivery failed for user %s", user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Airing notification scan failed")
+        await asyncio.sleep(600)
+
+
+async def airing_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    items = await context.application.bot_data["airing"].upcoming(update.effective_user.id, days=7)
+    if not items:
+        return await update.effective_message.reply_text(
+            "No upcoming episode schedules were found for your Watching list in the next 7 days. "
+            "AniList coverage depends on the title."
+        )
+    settings = context.application.bot_data["settings"]
+    zone = ZoneInfo(settings.timezone)
+    lines = ["📅 <b>Your upcoming episodes (7 days)</b>"]
+    for item in items:
+        local = item["release_at"].astimezone(zone)
+        lines.append(
+            f"• <b>{html.escape(item['title'])}</b> · Ep {item['episode']} — "
+            f"{local:%a, %d %b · %I:%M %p}"
+        )
+    lines.append("\n<i>Times are AniList estimates and may change.</i>")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def profile_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    db = context.application.bot_data["db"]
+    user_id = update.effective_user.id
+    rows = await db.watchlist.find({"user_id": user_id}).to_list(length=5000)
+    counts = {}
+    for row in rows:
+        status = row.get("status", "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    reviews = await db.reviews.count_documents({"user_id": user_id})
+    favourites = await db.watchlist.count_documents({"user_id": user_id, "favourite": True})
+    progress = await db.progress.find({"user_id": user_id}).to_list(length=5000)
+    episodes = sum(len(set(row.get("watched_episodes", []))) for row in progress)
+    ratings = [row.get("rating") for row in rows if isinstance(row.get("rating"), (int, float))]
+    average = sum(ratings) / len(ratings) if ratings else None
+    lines = [
+        f"👤 <b>{html.escape(update.effective_user.first_name or 'Your')} · Anime profile</b>",
+        f"📚 Titles tracked: <b>{len(rows)}</b>",
+        f"▶️ Watching: <b>{counts.get('watching', 0)}</b>",
+        f"✅ Completed: <b>{counts.get('completed', 0)}</b>",
+        f"📝 Plan to watch: <b>{counts.get('plan', 0)}</b>",
+        f"⏸ On hold: <b>{counts.get('on_hold', 0)}</b>",
+        f"❌ Dropped: <b>{counts.get('dropped', 0)}</b>",
+        f"⭐ Favourites: <b>{favourites}</b>",
+        f"✍️ Reviews: <b>{reviews}</b>",
+        f"🎬 Episodes logged: <b>{episodes}</b>",
+        f"⭐ Average personal rating: <b>{average:.1f}/10</b>" if average is not None else "⭐ Average personal rating: —",
+    ]
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def news_cmd(update, context):
+    if not await allowed(update, context):
+        return
+    url = "https://www.animenewsnetwork.com/newsroom/rss.xml?ann"
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+        root = ET.fromstring(response.content)
+        items = root.findall(".//item")[:8]
+        if not items:
+            raise ValueError("No feed items")
+        lines = ["📰 <b>Latest anime news</b>"]
+        for item in items:
+            title = (item.findtext("title") or "Untitled").strip()
+            link = (item.findtext("link") or "").strip()
+            if link.startswith("https://"):
+                lines.append(f'• <a href="{html.escape(link, quote=True)}">{html.escape(title)}</a>')
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+    except (httpx.HTTPError, ET.ParseError, ValueError):
+        await update.effective_message.reply_text(
+            "Anime news is temporarily unavailable. Please try again later."
+        )
+
+
+
 def build_app():
     settings = get_settings()
     settings.validate_runtime()
@@ -2362,6 +2499,9 @@ def build_app():
         "users": all_users_cmd,
         "pending_users": pending_users_cmd,
         "stats": stats,
+        "profile": profile_cmd,
+        "airing": airing_cmd,
+        "news": news_cmd,
         "movies": genre_command("movie"),
         "series": genre_command("series"),
         "top": genre_command("top"),
