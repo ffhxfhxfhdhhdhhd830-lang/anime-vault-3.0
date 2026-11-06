@@ -196,6 +196,44 @@ class AniListService:
                 saved.append({**anime, "_display_genre": row.get("_genre")})
         return saved
 
+    async def public_user_list(self, username: str) -> list[dict[str, Any]]:
+        """Fetch a public AniList anime list; private lists require OAuth and are not imported."""
+        username = username.strip()
+        if not username or len(username) > 50:
+            raise ValueError("Enter a valid AniList username.")
+        query = """
+        query ($name: String!) {
+          MediaListCollection(userName: $name, type: ANIME) {
+            lists {
+              entries {
+                status
+                progress
+                score
+                media { id title { english romaji native } genres format siteUrl startDate { year } }
+              }
+            }
+          }
+        }
+        """
+        try:
+            response = await self.client.post(
+                ANILIST_URL, json={"query": query, "variables": {"name": username}},
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeError("AniList could not be reached right now.") from exc
+        if payload.get("errors"):
+            raise ValueError("That AniList profile could not be read. Check the username and profile privacy.")
+        collection = (payload.get("data") or {}).get("MediaListCollection")
+        if collection is None:
+            raise ValueError("AniList profile not found or its list is private.")
+        entries = []
+        for group in collection.get("lists") or []:
+            entries.extend(group.get("entries") or [])
+        return entries
+
     async def enrich_catalogue(self, rows: list[dict[str, Any]]) -> None:
         missing = [row for row in rows if not genres_for(row) and row.get("title")]
         if not missing:
