@@ -36,4 +36,8 @@ async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     await db.audit.create_index([("at", -1)])
     await db.streaming.create_index([("anime_id", 1), ("region", 1)])
     await db.activity.create_index([("user_id", 1), ("at", -1)])
+    await db.episode_events.create_index([("user_id", 1), ("anime_id", 1), ("at", -1)])
+    await db.reviews.create_index([("user_id", 1), ("anime_id", 1)], unique=True)
+    await db.reminders.create_index([("due_at", 1), ("sent_at", 1), ("cancelled_at", 1)])
+    await db.reminders.create_index([("user_id", 1), ("due_at", 1)])
 
