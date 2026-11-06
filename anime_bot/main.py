@@ -1234,7 +1234,7 @@ async def about_text(context):
         '‣ ᴍʏ ᴅᴀʀʟɪɴɢ : <a href="tg://settings">ᴍʏ ᴅᴀʀʟɪɴɢ</a>\n'
         '‣ ᴅᴇᴠᴇʟᴏᴘᴇʀ : <a href="https://t.me/Nobita_MUI">ʜᴜʙʙʏ</a>\n'
         '‣ ʟɪʙʀᴀʀʏ : <a href="https://docs.python-telegram-bot.org/en/v22.5/">python-telegram-bot 22.5</a>\n'
-        '‣ ᴀɪ ᴄʀᴇᴅɪᴛ : <a href="https://openai.com/chatgpt/">ChatGPT</a> + <a href="https://openai.com/codex/">OpenAI Codex</a>\\n'
+        '‣ ᴀɪ ᴄʀᴇᴅɪᴛ : <a href="https://openai.com/chatgpt/">ChatGPT</a> + <a href="https://openai.com/codex/">OpenAI Codex</a>\n'
         '‣ ʟᴀɴɢᴜᴀɢᴇ : <a href="https://www.python.org/download/releases/3.0/">ᴘʏᴛʜᴏɴ 3</a>\n'
         '‣ ᴅᴀᴛᴀ ʙᴀsᴇ : <a href="https://www.mongodb.com/">ᴍᴏɴɢᴏ ᴅʙ</a>\n'
         f"‣ ʙᴏᴛ sᴇʀᴠᴇʀ : {provider}\n"
