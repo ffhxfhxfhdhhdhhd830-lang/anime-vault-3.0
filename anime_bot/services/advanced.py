@@ -33,12 +33,14 @@ class TrackingService:
             key,
             {
                 "$addToSet": {"watched_episodes": episode},
-                "$set": {"updated_at": now},
                 "$setOnInsert": {"user_id": user_id, "anime_id": aid},
             },
             upsert=True,
         )
         row = await self.db.progress.find_one(key) or {}
+        if not result.modified_count:
+            return False, len(set(row.get("watched_episodes", [])))
+        await self.db.progress.update_one(key, {"$set": {"updated_at": now}})
         watched = sorted(set(row.get("watched_episodes", [])))
         count = len(watched)
         await self.db.progress.update_one(
@@ -50,17 +52,15 @@ class TrackingService:
                 "updated_at": now,
             }},
         )
-        if result.modified_count:
-            await self.db.episode_events.insert_one({
-                "user_id": user_id, "anime_id": aid, "episode": episode,
-                "action": "watched", "active": True, "at": now,
-            })
-            await self.db.activity.insert_one({
-                "user_id": user_id, "anime_id": aid, "kind": "episode",
-                "value": episode, "at": now,
-            })
-            return True, count
-        return False, count
+        await self.db.episode_events.insert_one({
+            "user_id": user_id, "anime_id": aid, "episode": episode,
+            "action": "watched", "active": True, "at": now,
+        })
+        await self.db.activity.insert_one({
+            "user_id": user_id, "anime_id": aid, "kind": "episode",
+            "value": episode, "at": now,
+        })
+        return True, count
 
     async def undo_last_episode(self, user_id: int, anime_id: str) -> tuple[int, int] | None:
         if not ObjectId.is_valid(anime_id):
