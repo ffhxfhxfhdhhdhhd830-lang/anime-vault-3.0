@@ -11,7 +11,7 @@ A private, MongoDB-backed Telegram tracker. The project works without external m
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\\.venv\\Scripts\\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 Copy-Item .env.example .env
@@ -20,22 +20,24 @@ python -m anime_bot.database.indexes
 python -m anime_bot.main
 ```
 
+For Docker Compose, set `MONGODB_URI=mongodb://mongo:27017` in `.env` when using the bundled MongoDB service, then run `docker compose up --build -d`. If using MongoDB Atlas, keep the Atlas URI in `.env` instead. Compose waits for its MongoDB health check before starting the bot.
+
 The bot also initializes indexes safely at startup. To import the Excel file, first preview it:
 
 ```powershell
-python scripts/import_workbook.py .\anime_master_watchlist.xlsx --dry-run
-python scripts/import_workbook.py .\anime_master_watchlist.xlsx
+python scripts/import_workbook.py .\\anime_master_watchlist.xlsx --dry-run
+python scripts/import_workbook.py .\\anime_master_watchlist.xlsx
 ```
 
 The importer accepts a path, reads title/year/genre/status columns when recognized, and inserts imported statuses only for users without an existing record. It does not merge similar names automatically. Review the dry run before committing.
 
-Run checks with `python -m pytest` and `ruff check .`. Stop locally with Ctrl+C; the bot closes MongoDB cleanly. For backups, use `mongodump --uri "$env:MONGODB_URI" --db $env:MONGODB_DATABASE --out .\backup` and protect the backup as sensitive personal data.
+Run checks with `python -m pytest` and `ruff check .`. Stop locally with Ctrl+C; the bot closes MongoDB cleanly. For backups, use `mongodump --uri "$env:MONGODB_URI" --db $env:MONGODB_DATABASE --out .\\backup` and protect the backup as sensitive personal data.
 
 ## Metadata and streaming providers
 
 `TMDB_API_KEY` optionally enables TMDb genre enrichment and region-specific provider listings for `/wtw`. A title is matched by name and format with a confidence threshold; uncertain matches are left unresolved. Provider search links are clearly labeled and do not verify availability. TMDb provider listings and its returned link are the source of verified offers. `STREAMING_API_KEY` remains reserved because no authorized provider API adapter is configured. IMDb ratings are not inferred from TMDb.
 
-Set `DEFAULT_REGION=IN` (or another TMDb region code) and optionally configure `DEPLOYMENT_PROVIDER` for the About screen. The default About value is "Not configured." `PICS` accepts multiple image URLs or Telegram file IDs separated by spaces; the bot chooses one for the menu and rotates it on button navigation. Without `PICS`, the built-in image list is used. `LOG_CHANNEL` receives startup, first-seen user, bot group/channel membership, utility-command, and unhandled-error notices. Use `/logtest` as owner to check delivery; the bot also posts a startup confirmation. The log channel needs a numeric chat ID, and the bot must be an administrator with permission to post.
+Set `DEFAULT_REGION=IN` (or another TMDb region code) and optionally configure `DEPLOYMENT_PROVIDER` for the About screen. The default About value is "Not configured." `PICS` accepts multiple image URLs or Telegram file IDs separated by spaces; the bot chooses one for the menu and rotates it on button navigation. Without `PICS`, the built-in image list is used. `LOG_CHANNEL` receives startup, membership, first-seen-user, utility-command, and error notices. Use `/logtest` as owner to check delivery; the bot also posts a startup confirmation. The log channel needs a numeric chat ID, and the bot must be an administrator with permission to post.
 
 Genre normalization supports legacy fields such as `genre`, `Genres`, and `genre_names`. Run a safe, repeatable backfill after deployment:
 
@@ -55,4 +57,3 @@ Use `/delete <title>` to remove a manually added catalogue title. The bot asks f
 Add or update catalogue details with `/add <title> | <genres> | <format> | <synopsis>`. For example: `/add Frieren | Adventure, Drama, Fantasy | series | An elf mage reflects on a journey after the heroes' victory.` Supported formats are `movie`, `series`, `OVA`, `ONA`, `special`, `short`, and `franchise` (`film` and `tv` are accepted aliases). Genres, format, and synopsis are optional; keep the separators to leave an earlier field blank, such as `/add My Title | | movie | A short synopsis.` You can also keep using `/add <title>` or `/add <title> | <genres>`. If the title already exists, the supplied details update that catalogue entry.
 
 All handlers that reveal personal or catalogue data check authorization. The owner is always recognized by numeric ID; approved users are stored in `authorized_users`. MongoDB is never dropped or cleared at startup. Keep a least-privilege DB account and encrypted backups.
-
