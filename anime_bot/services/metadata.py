@@ -163,8 +163,13 @@ class MetadataService:
         region = region.upper()
         cache_key = str(anime.get("_id") or normalize(str(anime.get("title") or "")))
         now = datetime.now(timezone.utc)
-        cached = await self.db.streaming.find_one(
-            {"cache_key": cache_key, "region": region, "expires_at": {"$gt": now}}
+        streaming_cache = getattr(self.db, "streaming", None)
+        cached = (
+            await streaming_cache.find_one(
+                {"cache_key": cache_key, "region": region, "expires_at": {"$gt": now}}
+            )
+            if streaming_cache is not None
+            else None
         )
         if cached:
             return cached.get("payload", {"region": region, "offers": [], "available": False})
@@ -196,16 +201,17 @@ class MetadataService:
             "link": region_data.get("link"),
             "available": bool(offers),
         }
-        await self.db.streaming.update_one(
-            {"cache_key": cache_key, "region": region},
-            {"$set": {
-                "cache_key": cache_key,
-                "region": region,
-                "payload": payload,
-                "expires_at": now + timedelta(hours=6),
-                "updated_at": now,
-            }},
-            upsert=True,
-        )
+        if streaming_cache is not None:
+            await streaming_cache.update_one(
+                {"cache_key": cache_key, "region": region},
+                {"$set": {
+                    "cache_key": cache_key,
+                    "region": region,
+                    "payload": payload,
+                    "expires_at": now + timedelta(hours=6),
+                    "updated_at": now,
+                }},
+                upsert=True,
+            )
         return payload
 
