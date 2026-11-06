@@ -3,6 +3,7 @@ import html
 import logging
 import random
 import re
+import httpx
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
