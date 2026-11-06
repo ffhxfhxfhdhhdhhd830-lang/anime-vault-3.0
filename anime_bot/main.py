@@ -1238,7 +1238,7 @@ async def about_text(context):
         '‣ ʟᴀɴɢᴜᴀɢᴇ : <a href="https://www.python.org/download/releases/3.0/">ᴘʏᴛʜᴏɴ 3</a>\n'
         '‣ ᴅᴀᴛᴀ ʙᴀsᴇ : <a href="https://www.mongodb.com/">ᴍᴏɴɢᴏ ᴅʙ</a>\n'
         f"‣ ʙᴏᴛ sᴇʀᴠᴇʀ : {provider}\n"
-        "‣ ʙᴜɪʟᴅ sᴛᴀᴛᴜs : ᴠ2.7.1 [sᴛᴀʙʟᴇ]</b>"
+        "‣ ʙᴜɪʟᴅ sᴛᴀᴛᴜs : ᴠ3.0 [ɪᴍᴘʀᴏᴠᴇᴅ]</b>"
     )
 
 
