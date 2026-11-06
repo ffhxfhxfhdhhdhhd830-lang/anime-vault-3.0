@@ -1197,6 +1197,8 @@ def help_text():
         "/watchlist · /favorites · /watching · /completed · /plan · /onhold · /dropped\n"
         "/recommendations · /top · /movies · /series\n"
         "/wtw &lt;title&gt; · /progress · /continue · /stats · /export\n"
+        "/episode &lt;title&gt; &lt;number&gt; · /undoepisode &lt;title&gt; · /review &lt;title&gt; scores | text\n"
+        "/remind YYYY-MM-DD HH:MM | title · /reminders · /cancelreminder &lt;id&gt;\n"
         "/telegraph · /stickerid · /font &lt;text&gt; · /repo &lt;query&gt; · /imdb &lt;title&gt; · /cancel\n\n"
         "<b>ᴏᴡɴᴇʀ ᴏɴʟʏ</b>\n"
         "/users · /pending_users · /info [id] · /id\n"
