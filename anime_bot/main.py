@@ -2085,10 +2085,70 @@ async def export_cmd(update, context):
 
 
 async def import_cmd(update, context):
-    if await allowed(update, context):
-        await update.message.reply_text(
-            "Use scripts/import_workbook.py <path.xlsx> --dry-run to preview, then rerun without --dry-run to import. Existing watch statuses are never overwritten."
-        )
+    if not await allowed(update, context):
+        return
+    if len(context.args) == 2 and context.args[0].casefold() == "anilist":
+        username = context.args[1]
+        service = context.application.bot_data["anilist"]
+        try:
+            entries = await service.public_user_list(username)
+            media_rows = [entry.get("media") for entry in entries if entry.get("media")]
+            saved = await service.save_titles(media_rows)
+            by_anilist = {row.get("anilist_id"): row for row in saved}
+            db = context.application.bot_data["db"]
+            user_id = update.effective_user.id
+            status_map = {
+                "CURRENT": "watching", "COMPLETED": "completed",
+                "PLANNING": "plan", "PAUSED": "on_hold",
+                "DROPPED": "dropped", "REPEATING": "rewatching",
+            }
+            imported = 0
+            preserved = 0
+            for entry in entries:
+                media = entry.get("media") or {}
+                anime = by_anilist.get(media.get("id"))
+                if not anime:
+                    continue
+                key = {"user_id": user_id, "anime_id": anime["_id"]}
+                status = status_map.get(entry.get("status"), "plan")
+                result = await db.watchlist.update_one(
+                    key,
+                    {"$setOnInsert": {
+                        **key, "status": status, "rating": round(entry.get("score", 0) / 10) if entry.get("score") else None,
+                        "favourite": False, "priority": 0, "notes": "", "rewatch_count": 0,
+                        "added_at": datetime.now(timezone.utc),
+                    }},
+                    upsert=True,
+                )
+                if result.upserted_id:
+                    imported += 1
+                else:
+                    preserved += 1
+                progress = int(entry.get("progress") or 0)
+                if progress > 0:
+                    await db.progress.update_one(
+                        key,
+                        {"$setOnInsert": {
+                            **key, "watched_episodes": list(range(1, min(progress, 5000) + 1)),
+                            "episodes_completed": min(progress, 5000),
+                            "last_watched_episode": min(progress, 5000),
+                            "updated_at": datetime.now(timezone.utc),
+                        }},
+                        upsert=True,
+                    )
+            await update.effective_message.reply_text(
+                f"✅ AniList import finished for @{html.escape(username)}.\n"
+                f"New titles: {imported}\nExisting entries preserved: {preserved}\n"
+                "Only public AniList lists are supported; private lists need account authorization."
+            , parse_mode=ParseMode.HTML)
+        except (ValueError, RuntimeError) as exc:
+            await update.effective_message.reply_text(str(exc))
+        return
+    await update.effective_message.reply_text(
+        "Import options:\n/import anilist <username> — import a public AniList list.\n"
+        "For an Excel workbook, use scripts/import_workbook.py <path.xlsx> --dry-run first. "
+        "Existing watch statuses are never overwritten."
+    )
 
 
 async def post_init(app):
