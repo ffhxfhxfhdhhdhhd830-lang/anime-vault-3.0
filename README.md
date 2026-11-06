@@ -31,7 +31,40 @@ python scripts/import_workbook.py .\\anime_master_watchlist.xlsx
 
 The importer accepts a path, reads title/year/genre/status columns when recognized, and inserts imported statuses only for users without an existing record. It does not merge similar names automatically. Review the dry run before committing.
 
-Run checks with `python -m pytest` and `ruff check .`. Stop locally with Ctrl+C; the bot closes MongoDB cleanly. For backups, use `mongodump --uri "$env:MONGODB_URI" --db $env:MONGODB_DATABASE --out .\\backup` and protect the backup as sensitive personal data.
+Run checks with `python -m pytest` and `ruff check anime_bot scripts tests`. Stop locally with Ctrl+C; the bot closes MongoDB cleanly.
+
+### Backups and recovery
+
+Install MongoDB Database Tools, then create a compressed, timestamped archive:
+
+```powershell
+python scripts/backup_mongodb.py
+```
+
+Verify a backup by restoring it into a separate database (the default is `anime_command_center_restore`):
+
+```powershell
+python scripts/restore_mongodb.py .\\backups\\YOUR_BACKUP.archive.gz
+```
+
+The restore script blocks targeting the live database. Inspect the restored database before planning any production recovery. Keep archives encrypted and outside Git; backups contain private watchlists and user data.
+
+### Tracking, reviews and reminders
+
+- `/episode Frieren 5` marks episode 5 as watched. Episode numbers are stored individually and duplicate taps do not add duplicate progress.
+- `/undoepisode Frieren` undoes the most recently logged episode for that title.
+- `/review Frieren 9 10 9 10 | Beautiful storytelling` saves story, animation, music and overall scores (each 1–10), plus optional review text. The overall score is also used by recommendations.
+- `/remind 2026-11-07 20:00 | Watch Frieren` schedules a reminder using the configured `TIMEZONE`; use `/reminders` to list and `/cancelreminder <id>` to cancel. Delivery is persisted and uses a retryable lease after worker restarts.
+
+Recommendations now use your ratings, favorites, completed titles and dropped-title signals to weight genre preferences. A small or empty watch history naturally produces less personalized suggestions.
+
+## Credits
+
+- Project owner and maintainer: repository owner.
+- AI development assistance: **ChatGPT by OpenAI** for planning, code review and implementation assistance.
+- Coding assistant: **OpenAI Codex** for code-generation and repository-development workflows.
+
+AI tools are credited as assistants; project ownership and final review remain with the human maintainer.
 
 ## Metadata and streaming providers
 
@@ -50,7 +83,7 @@ The backfill only adds/normalizes the anime document's `genres` field; it does n
 
 ## Current scope and limitations
 
-Implemented: async Telegram command bot, Mongo persistence/indexes, owner-only authorization administration, persisted access requests, private-chat default, catalogue search and manual additions, status-aware watchlist updates, personal favorites, 1–10 ratings, multi-select genre filters, AniList-backed discovery with paginated anime buttons, top unwatched anime by genre, genre-filtered watchlist/completed views, optional cached TMDb provider enrichment, `/wtw`, `/users`, `/pending_users`, `/info`, `/id`, `/chats`, `/channel`, `/connections`, `/connect`, `/disconnect`, group `/disable`, `/enable`, and `/leave`, owner-confirmed `/broadcast` and `/grp_broadcast`, `/totalrequests`, confirmation-protected `/purgerequests`, `/logs`, `/logtest`, `/restart`, `/repo`, `/imdb`, `/telegraph`, `/stickerid`, and `/font`; Help and About screens; rotating PICS-backed photo/caption menus; LOG_CHANNEL startup, membership, first-seen-user, utility-command, and error notices; personal JSON export, statistics, confirmed-title seeding, and Excel dry-run/import. The IMDb command shows verified catalogue fields and links to IMDb search; it never invents ratings. Broadcast commands require an explicit `CONFIRM` argument. Genre menus include the requested anime categories and AniList catalogue genres. AniList genre enrichment fills missing catalogue genres when a title can be matched. Persistent reminder scheduling, custom collections, and review text entry are not implemented yet. Commands requiring these features respond honestly rather than fabricating results.
+Implemented: async Telegram command bot, Mongo persistence/indexes, owner-only authorization administration, persisted access requests, private-chat default, catalogue search and manual additions, status-aware watchlist updates, personal favorites, 1–10 ratings, multi-select genre filters, AniList-backed discovery with paginated anime buttons, top unwatched anime by genre, genre-filtered watchlist/completed views, optional cached TMDb provider enrichment, `/wtw`, `/users`, `/pending_users`, `/info`, `/id`, `/chats`, `/channel`, `/connections`, `/connect`, `/disconnect`, group `/disable`, `/enable`, and `/leave`, owner-confirmed `/broadcast` and `/grp_broadcast`, `/totalrequests`, confirmation-protected `/purgerequests`, `/logs`, `/logtest`, `/restart`, `/repo`, `/imdb`, `/telegraph`, `/stickerid`, and `/font`; Help and About screens; rotating PICS-backed photo/caption menus; LOG_CHANNEL startup, membership, first-seen-user, utility-command, and error notices; personal JSON export, statistics, confirmed-title seeding, and Excel dry-run/import. The IMDb command shows verified catalogue fields and links to IMDb search; it never invents ratings. Broadcast commands require an explicit `CONFIRM` argument. Genre menus include the requested anime categories and AniList catalogue genres. AniList genre enrichment fills missing catalogue genres when a title can be matched. Episode-by-episode logging with undo, structured personal reviews, and persistent scheduled reminders are implemented. Custom collections and automated live streaming-provider availability remain future work.
 
 Use `/delete <title>` to remove a manually added catalogue title. The bot asks for confirmation and refuses permanent deletion if another user's watchlist, progress, or activity records reference it.
 
