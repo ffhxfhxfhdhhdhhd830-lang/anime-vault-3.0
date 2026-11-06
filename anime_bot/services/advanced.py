@@ -123,6 +123,19 @@ class ReviewService:
             {"$set": row, "$setOnInsert": {"created_at": now}},
             upsert=True,
         )
+        # Keep the overall review score available to the recommendation engine.
+        await self.db.watchlist.update_one(
+            {"user_id": user_id, "anime_id": aid},
+            {
+                "$set": {"rating": scores["overall"], "updated_at": now},
+                "$setOnInsert": {
+                    "user_id": user_id, "anime_id": aid, "status": "unknown",
+                    "favourite": False, "priority": 0, "notes": "", "review": "",
+                    "rewatch_count": 0, "added_at": now,
+                },
+            },
+            upsert=True,
+        )
         await self.db.activity.insert_one({
             "user_id": user_id, "anime_id": aid, "kind": "review",
             "value": scores["overall"], "at": now,
