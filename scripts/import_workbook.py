@@ -3,7 +3,9 @@
 import argparse
 import asyncio
 from pathlib import Path
+
 from openpyxl import load_workbook
+
 from anime_bot.config import get_settings
 from anime_bot.database.mongo import Mongo
 from anime_bot.services.core import normalize
@@ -13,13 +15,19 @@ TITLE_COLUMNS = ("title", "anime", "name", "english title", "series")
 STATUS_MAP = {
     "plan to watch": "plan",
     "planned": "plan",
+    "planning": "plan",
     "plan": "plan",
     "completed": "completed",
     "watched": "completed",
     "watching": "watching",
     "on hold": "on_hold",
     "hold": "on_hold",
+    "on_hold": "on_hold",
     "dropped": "dropped",
+    "rewatching": "rewatching",
+    "re-watching": "rewatching",
+    "not interested": "not_interested",
+    "not_interested": "not_interested",
     "unknown": "unknown",
 }
 
@@ -27,46 +35,51 @@ STATUS_MAP = {
 def read_rows(path: Path):
     book = load_workbook(path, read_only=True, data_only=True)
     rows = []
-    for sheet in book.worksheets:
-        iterator = sheet.iter_rows(values_only=True)
-        headers = next(iterator, None)
-        if not headers:
-            continue
-        keys = [str(x or "").strip().casefold() for x in headers]
-        title_idx = next((keys.index(k) for k in TITLE_COLUMNS if k in keys), None)
-        if title_idx is None:
-            continue
-        for number, values in enumerate(iterator, start=2):
-            title = (
-                str(values[title_idx] or "").strip() if title_idx < len(values) else ""
-            )
-            if not title:
+    try:
+        for sheet in book.worksheets:
+            iterator = sheet.iter_rows(values_only=True)
+            headers = next(iterator, None)
+            if not headers:
                 continue
-            item = {
-                k: (values[i] if i < len(values) else None)
-                for i, k in enumerate(keys)
-                if k
-            }
-            status_raw = (
-                str(item.get("status") or item.get("watch status") or "")
-                .strip()
-                .casefold()
-            )
-            genre_values = normalize_genres(
-                item.get("genres") or item.get("genre") or item.get("genre names")
-            )
-            rows.append(
-                {
-                    "title": title,
-                    "normalized": normalize(title),
-                    "status": STATUS_MAP.get(status_raw),
-                    "genres": genre_values,
-                    "row": number,
-                    "sheet": sheet.title,
-                    "raw": item,
+            keys = [str(x or "").strip().casefold() for x in headers]
+            title_idx = next((keys.index(k) for k in TITLE_COLUMNS if k in keys), None)
+            if title_idx is None:
+                continue
+            for number, values in enumerate(iterator, start=2):
+                title = (
+                    str(values[title_idx] or "").strip()
+                    if title_idx < len(values)
+                    else ""
+                )
+                if not title:
+                    continue
+                item = {
+                    k: (values[i] if i < len(values) else None)
+                    for i, k in enumerate(keys)
+                    if k
                 }
-            )
-    return rows
+                status_raw = (
+                    str(item.get("status") or item.get("watch status") or "")
+                    .strip()
+                    .casefold()
+                )
+                genre_values = normalize_genres(
+                    item.get("genres") or item.get("genre") or item.get("genre names")
+                )
+                rows.append(
+                    {
+                        "title": title,
+                        "normalized": normalize(title),
+                        "status": STATUS_MAP.get(status_raw),
+                        "genres": genre_values,
+                        "row": number,
+                        "sheet": sheet.title,
+                        "raw": item,
+                    }
+                )
+        return rows
+    finally:
+        book.close()
 
 
 async def run(path: Path, dry_run: bool):
@@ -167,4 +180,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
