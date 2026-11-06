@@ -334,7 +334,7 @@ class RecommendationService:
             elif preferences:
                 reason = "A fresh pick from your selected genre"
             else:
-                reason = "Add ratings or favorites to personalize recommendations"
+                reason = "Not personalized yet — add ratings or favorites to improve suggestions"
             results.append((anime, reason))
         return results
 
