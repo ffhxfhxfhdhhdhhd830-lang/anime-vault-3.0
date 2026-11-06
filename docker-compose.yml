@@ -4,11 +4,23 @@ services:
     restart: unless-stopped
     volumes:
       - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   bot:
     build: .
     env_file: .env
+    # Containers reach one another by Compose service name, not localhost.
+    environment:
+      MONGODB_URI: mongodb://mongo:27017
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
     restart: unless-stopped
+
 volumes:
   mongodb_data:
